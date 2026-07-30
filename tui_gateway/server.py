@@ -7106,6 +7106,41 @@ def _handle_busy_submit(
     return _ok(rid, {"status": "queued"})
 
 
+def _apply_pending_model_switch(sid: str, session: dict) -> None:
+    """Apply a model switch that arrived mid-turn, now that the turn is done.
+
+    config.set parks the pick rather than refusing it (switch_model mutates
+    agent state the worker thread is reading), so the UI can paint it
+    immediately. This is the other half: claim it under the lock, apply it,
+    and republish session.info so every surface converges on the real model.
+    A failure is logged and dropped — the next session.info re-syncs the UI to
+    whatever the agent actually runs.
+    """
+    with session["history_lock"]:
+        # Check running BEFORE claiming: popping first would drop the pick on
+        # the floor whenever this races a turn that is still going.
+        if session.get("running"):
+            return
+        pending = session.pop("pending_model_switch", None)
+        if not pending:
+            return
+
+    try:
+        _apply_model_switch(
+            sid,
+            session,
+            pending["value"],
+            confirm_expensive_model=bool(pending.get("confirm_expensive_model")),
+        )
+    except Exception:
+        logger.warning("deferred model switch failed for session %s", sid, exc_info=True)
+
+    try:
+        _emit("session.info", sid, _session_info(session.get("agent"), session))
+    except Exception:
+        logger.debug("session.info after deferred model switch failed", exc_info=True)
+
+
 def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     """Fire a queued next-turn prompt if one is waiting and the session is idle.
 
@@ -7113,6 +7148,10 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     lower-priority follow-ups this cycle — the user's message wins). Mirrors the
     claim-under-lock pattern used by the goal-continuation re-fire.
     """
+    # A mid-turn model pick applies BEFORE the queued prompt runs, so the
+    # message the user typed while switching goes to the model they picked.
+    _apply_pending_model_switch(sid, session)
+
     with session["history_lock"]:
         queued = session.get("queued_prompt")
         if not queued or session.get("running"):
@@ -9956,19 +9995,36 @@ def _(rid, params: dict) -> dict:
             if not value:
                 return _err(rid, 4002, "model value required")
             if session:
-                # Reject during an in-flight turn.  agent.switch_model()
+                # A switch can't be applied mid-turn: agent.switch_model()
                 # mutates self.model / self.provider / self.base_url /
-                # self.client in place; the worker thread running
-                # agent.run_conversation is reading those on every
-                # iteration.  A mid-turn swap can send an HTTP request
-                # with the new base_url but old model (or vice versa),
-                # producing 400/404s the user never asked for.  Parity
-                # with the gateway's running-agent /model guard.
+                # self.client in place while the worker thread running
+                # agent.run_conversation reads them every iteration, so a
+                # live swap can send the new base_url with the old model
+                # (400/404s the user never asked for).
+                #
+                # That's a reason to DELAY the swap, not to refuse it. Park
+                # it on the session and let the turn-completion path apply
+                # it (see _apply_pending_model_switch); the caller gets a
+                # normal ok with scope="pending" so the UI can paint the
+                # pick immediately instead of erroring at the user.
                 if session.get("running"):
-                    return _err(
+                    with session["history_lock"]:
+                        session["pending_model_switch"] = {
+                            "value": value,
+                            "confirm_expensive_model": bool(
+                                params.get("confirm_expensive_model", False)
+                            ),
+                        }
+                    return _ok(
                         rid,
-                        4009,
-                        "session busy — /interrupt the current turn before switching models",
+                        {
+                            "key": key,
+                            "value": value,
+                            "warning": "",
+                            "confirm_required": False,
+                            "confirm_message": "",
+                            "scope": "pending",
+                        },
                     )
                 from hermes_cli.model_switch import parse_model_switch_args
 
