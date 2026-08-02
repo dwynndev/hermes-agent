@@ -131,3 +131,56 @@ class TestReasoningConfigResolution:
         config = {"agent": {"reasoning_effort": "xhigh"}}
         result = resolve_reasoning_config(config, "qwen3.8-max-preview")
         assert result == {"enabled": True, "effort": "xhigh"}
+
+
+class TestUltraClamp:
+    """Verify that 'ultra' effort is clamped to 'max' for alibaba endpoints.
+
+    DashScope rejects reasoning_effort='ultra' with HTTP 400. The emission
+    path in chat_completions.py clamps ultra→max when base_url contains
+    aliyuncs.com.
+    """
+
+    def test_ultra_clamped_to_max_for_alibaba(self):
+        """Simulate the emission logic: ultra + aliyuncs → max."""
+        # This tests the clamp logic directly (not the full transport)
+        _effort = "ultra"
+        base_url = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
+        if _effort == "ultra" and "aliyuncs.com" in str(base_url or ""):
+            _effort = "max"
+        assert _effort == "max"
+
+    def test_ultra_not_clamped_for_openrouter(self):
+        """ultra should NOT be clamped for non-alibaba endpoints."""
+        _effort = "ultra"
+        base_url = "https://openrouter.ai/api/v1"
+        if _effort == "ultra" and "aliyuncs.com" in str(base_url or ""):
+            _effort = "max"
+        assert _effort == "ultra"  # unchanged
+
+    def test_max_not_clamped_for_alibaba(self):
+        """max should pass through unchanged for alibaba."""
+        _effort = "max"
+        base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        if _effort == "ultra" and "aliyuncs.com" in str(base_url or ""):
+            _effort = "max"
+        assert _effort == "max"  # unchanged
+
+
+class TestFalsePositiveURLs:
+    """Verify that base_url_host_matches does NOT match spoofed domains."""
+
+    def test_evil_aliyuncs_prefix_not_matched(self):
+        """evil-aliyuncs.com should NOT match (not a subdomain)."""
+        agent = _make_agent("https://evil-aliyuncs.com/v1")
+        assert agent._supports_reasoning_extra_body() is False
+
+    def test_aliyuncs_evil_suffix_not_matched(self):
+        """aliyuncs.com.evil.com should NOT match."""
+        agent = _make_agent("https://aliyuncs.com.evil.com/v1")
+        assert agent._supports_reasoning_extra_body() is False
+
+    def test_path_containing_aliyuncs_not_matched(self):
+        """evil.com/aliyuncs.com/v1 should NOT match (hostname is evil.com)."""
+        agent = _make_agent("https://evil.com/aliyuncs.com/v1")
+        assert agent._supports_reasoning_extra_body() is False

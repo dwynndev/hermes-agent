@@ -479,6 +479,9 @@ class ChatCompletionsTransport(ProviderTransport):
                 _effort = "medium"
                 if reasoning_config and isinstance(reasoning_config, dict):
                     _effort = reasoning_config.get("effort", "medium") or "medium"
+                # DashScope/alibaba rejects "ultra" with HTTP 400; clamp to "max".
+                if _effort == "ultra" and "aliyuncs.com" in str(base_url or ""):
+                    _effort = "max"
                 extra_body["reasoning"] = {"enabled": True, "effort": _effort}
 
         if provider_name == "gemini":
