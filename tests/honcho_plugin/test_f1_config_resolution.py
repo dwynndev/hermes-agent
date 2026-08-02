@@ -14,6 +14,7 @@ import pytest
 
 from plugins.memory.honcho.client import (
     HonchoClientConfig,
+    _host_block,
     _is_local_base_url,
     _normalize_recall_mode,
     _normalize_observation_mode,
@@ -28,6 +29,46 @@ from plugins.memory.honcho.client import (
     _resolve_observation,
     _resolve_optional_float,
 )
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: _host_block
+# ---------------------------------------------------------------------------
+
+
+class TestHostBlock:
+    """_host_block: direct key + legacy dot-form fallback."""
+
+    def test_direct_key_found(self):
+        raw = {"hosts": {"hermes_builder": {"aiPeer": "b"}}}
+        assert _host_block(raw, "hermes_builder") == {"aiPeer": "b"}
+
+    def test_legacy_dot_form_fallback(self):
+        """hermes_builder should fall back to hermes.builder."""
+        raw = {"hosts": {"hermes.builder": {"aiPeer": "legacy"}}}
+        assert _host_block(raw, "hermes_builder") == {"aiPeer": "legacy"}
+
+    def test_direct_key_wins_over_dot_form(self):
+        raw = {"hosts": {
+            "hermes_builder": {"aiPeer": "direct"},
+            "hermes.builder": {"aiPeer": "legacy"},
+        }}
+        assert _host_block(raw, "hermes_builder") == {"aiPeer": "direct"}
+
+    def test_no_hosts_returns_empty(self):
+        assert _host_block({}, "hermes") == {}
+
+    def test_non_hermes_prefix_no_fallback(self):
+        """Keys not starting with 'hermes_' don't get dot-form fallback."""
+        raw = {"hosts": {"custom.profile": {"x": 1}}}
+        assert _host_block(raw, "custom_profile") == {}
+
+    def test_empty_block_no_fallback(self):
+        """If direct key exists but is empty dict, still returned (no fallback)."""
+        raw = {"hosts": {"hermes_x": {}}}
+        # Empty dict is falsy → triggers fallback check
+        # But hermes.x doesn't exist either → empty
+        assert _host_block(raw, "hermes_x") == {}
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +179,13 @@ class TestParseContextTokens:
     def test_invalid_returns_none(self):
         assert _parse_context_tokens("abc", "xyz") is None
 
+    def test_string_coercion(self):
+        assert _parse_context_tokens("4096", None) == 4096
+
+    def test_negative_value_accepted(self):
+        # int() accepts negatives — no clamping in this helper
+        assert _parse_context_tokens(-1, None) == -1
+
 
 class TestParseDialecticDepth:
     """_parse_dialectic_depth: clamped 1-3."""
@@ -203,6 +251,14 @@ class TestIsLocalBaseUrl:
     def test_cgnat_tailscale(self):
         assert _is_local_base_url("http://100.64.0.1:8000") is True
         assert _is_local_base_url("http://100.127.255.255:8000") is True
+
+    def test_cgnat_boundary_below_range(self):
+        # 100.63.x is NOT in CGNAT range (starts at 100.64.0.0)
+        assert _is_local_base_url("http://100.63.255.255:8000") is False
+
+    def test_cgnat_boundary_above_range(self):
+        # 100.128.x is NOT in CGNAT range (ends at 100.127.255.255)
+        assert _is_local_base_url("http://100.128.0.0:8000") is False
 
     def test_public_ips(self):
         assert _is_local_base_url("http://8.8.8.8:8000") is False
