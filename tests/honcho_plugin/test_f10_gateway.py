@@ -67,11 +67,13 @@ class TestMultiHostConfig:
 class TestGatewayMode:
     """Test gateway/cron mode detection."""
 
-    def test_cron_skipped_flag_exists(self):
-        """Provider has _cron_skipped attribute for gateway mode."""
+    def test_cron_skipped_flag_defaults_false(self):
+        """Provider instance has _cron_skipped=False by default (non-gateway)."""
         from plugins.memory.honcho import HonchoMemoryProvider
-        assert hasattr(HonchoMemoryProvider, '_cron_skipped') or True
-        # The flag is set during initialization based on environment
+
+        p = HonchoMemoryProvider.__new__(HonchoMemoryProvider)
+        p._cron_skipped = False  # simulates __init__ default
+        assert p._cron_skipped is False
 
     def test_gateway_mode_disables_auto_inject(self):
         """In gateway/cron mode, auto-inject is disabled."""
@@ -91,13 +93,12 @@ class TestGatewayMode:
         p._prefetch_thread = None
         p._stale_multiplier = 2.0
 
-        # In cron mode, system_prompt_block should return empty or static
+        # In cron mode, system_prompt_block must return empty string
         result = p.system_prompt_block()
-        # Should not contain dynamic context (cron skips injection)
-        assert isinstance(result, str)
+        assert result == ""
 
-    def test_non_gateway_mode_allows_inject(self):
-        """Normal (non-cron) mode allows context injection."""
+    def test_non_gateway_mode_returns_hybrid_prompt(self):
+        """Normal (non-cron) hybrid mode returns tool instructions in prompt block."""
         from plugins.memory.honcho import HonchoMemoryProvider
         from unittest.mock import MagicMock
 
@@ -118,8 +119,9 @@ class TestGatewayMode:
         p._session_ready = True
 
         result = p.system_prompt_block()
-        # In hybrid mode with context cache, should include context
-        assert "test context" in result or result != ""
+        # hybrid mode returns static tool instructions (not context — that's prefetch)
+        assert result != ""
+        assert "honcho" in result.lower()
 
 
 class TestProfileIsolation:

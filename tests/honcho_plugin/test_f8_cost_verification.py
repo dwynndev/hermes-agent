@@ -99,43 +99,47 @@ class TestCostModel:
 
     def test_cloud_minimal_cost_projection(self):
         """Cloud with optimized knobs → <$1/month for typical usage."""
-        # Typical: ~100 turns/day, 30 days = 3000 turns
-        # With tools mode: 0 auto calls
-        # Manual tool calls: ~10/day × 30 = 300 calls
-        # context() = free, search = ~$0.001, dialectic(minimal) = $0.001
-        # Total: 300 × $0.001 = $0.30/month
-        turns_per_day = 100
-        days = 30
+        # Verify the actual config knobs that make this projection valid:
+        # tools mode = 0 auto calls, saveMessages=false = 0 ingestion
+        cfg = _load_honcho_json()
+        host = cfg.get("hosts", {}).get("hermes", {})
+
+        # These knobs are what drive cost to near-zero
+        assert host.get("recallMode") == "tools"  # 0 auto-inject calls
+        assert host.get("saveMessages") is False  # 0 ingestion cost
+
+        # With only manual tool calls (~10/day × 30 × $0.001), cost < $1
         manual_calls_per_day = 10
+        days = 30
         cost_per_call = 0.001  # minimal dialectic or search
-
         monthly_cost = manual_calls_per_day * days * cost_per_call
-        assert monthly_cost < 1.0  # under $1/month
+        assert monthly_cost < 1.0
 
 
-class TestConfigParsingOptimized:
-    """Verify HonchoClientConfig correctly parses optimized values from real config."""
+class TestConfigParsingViaParser:
+    """Verify HonchoClientConfig.from_global_config() parses optimized values correctly."""
 
-    def test_recall_mode_tools_parsed(self):
-        """recallMode='tools' in JSON → parsed correctly."""
-        raw = _load_honcho_json()
-        host = raw.get("hosts", {}).get("hermes", {})
-        assert host.get("recallMode") == "tools"
+    @pytest.fixture(autouse=True)
+    def _real_hermes_home(self, monkeypatch):
+        """Point HERMES_HOME at the real ~/.hermes so from_global_config reads real honcho.json."""
+        monkeypatch.setenv("HERMES_HOME", os.path.expanduser("~/.hermes"))
 
-    def test_save_messages_false_parsed(self):
-        """saveMessages=false in JSON → parsed correctly."""
-        raw = _load_honcho_json()
-        host = raw.get("hosts", {}).get("hermes", {})
-        assert host.get("saveMessages") is False
+    def test_recall_mode_parsed_as_tools(self):
+        """Parser resolves recallMode='tools' from host block."""
+        cfg = HonchoClientConfig.from_global_config()
+        assert cfg.recall_mode == "tools"
 
-    def test_write_frequency_session_parsed(self):
-        """writeFrequency='session' in JSON → parsed correctly."""
-        raw = _load_honcho_json()
-        host = raw.get("hosts", {}).get("hermes", {})
-        assert host.get("writeFrequency") == "session"
+    def test_save_messages_parsed_as_false(self):
+        """Parser resolves saveMessages=false from host block."""
+        cfg = HonchoClientConfig.from_global_config()
+        assert cfg.save_messages is False
 
-    def test_dialectic_level_minimal_parsed(self):
-        """dialecticReasoningLevel='minimal' in JSON → parsed correctly."""
-        raw = _load_honcho_json()
-        host = raw.get("hosts", {}).get("hermes", {})
-        assert host.get("dialecticReasoningLevel") == "minimal"
+    def test_write_frequency_parsed_as_session(self):
+        """Parser resolves writeFrequency='session' from host block."""
+        cfg = HonchoClientConfig.from_global_config()
+        assert cfg.write_frequency == "session"
+
+    def test_dialectic_level_parsed_as_minimal(self):
+        """Parser resolves dialecticReasoningLevel='minimal' from host block."""
+        cfg = HonchoClientConfig.from_global_config()
+        assert cfg.dialectic_reasoning_level == "minimal"
