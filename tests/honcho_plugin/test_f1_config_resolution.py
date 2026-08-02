@@ -780,6 +780,16 @@ class TestFromGlobalConfigMiscFields:
         cfg = HonchoClientConfig.from_global_config(host="hermes", config_path=config_path)
         assert cfg.timeout == 22.0
 
+    def test_request_timeout_alias(self, tmp_path):
+        """requestTimeout is an alias for timeout."""
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(json.dumps({
+            "apiKey": "k", "enabled": True,
+            "hosts": {"hermes": {"requestTimeout": 12.0, "enabled": True}}
+        }))
+        cfg = HonchoClientConfig.from_global_config(host="hermes", config_path=config_path)
+        assert cfg.timeout == 12.0
+
     def test_dialectic_dynamic_false(self, tmp_path):
         config_path = tmp_path / "honcho.json"
         config_path.write_text(json.dumps({
@@ -877,6 +887,66 @@ class TestFromGlobalConfigMiscFields:
         assert cfg.peer_name == "eri"
         assert cfg.ai_peer == "coder"
 
+    def test_init_on_session_start(self, tmp_path):
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(json.dumps({
+            "apiKey": "k", "enabled": True,
+            "hosts": {"hermes": {"initOnSessionStart": True, "enabled": True}}
+        }))
+        cfg = HonchoClientConfig.from_global_config(host="hermes", config_path=config_path)
+        assert cfg.init_on_session_start is True
+
+    def test_session_peer_prefix(self, tmp_path):
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(json.dumps({
+            "apiKey": "k", "enabled": True,
+            "hosts": {"hermes": {"sessionPeerPrefix": "sess_", "enabled": True}}
+        }))
+        cfg = HonchoClientConfig.from_global_config(host="hermes", config_path=config_path)
+        assert cfg.session_peer_prefix == "sess_"
+
+    def test_environment_field(self, tmp_path):
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(json.dumps({
+            "apiKey": "k", "enabled": True,
+            "environment": "local",
+        }))
+        cfg = HonchoClientConfig.from_global_config(host="hermes", config_path=config_path)
+        assert cfg.environment == "local"
+
+    def test_base_url_from_env(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HONCHO_BASE_URL", "http://env-host:9000")
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(json.dumps({"apiKey": "k", "enabled": True}))
+        cfg = HonchoClientConfig.from_global_config(host="hermes", config_path=config_path)
+        assert cfg.base_url == "http://env-host:9000"
+
+    def test_workspace_defaults_to_host_name(self, tmp_path):
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(json.dumps({"apiKey": "k", "enabled": True}))
+        cfg = HonchoClientConfig.from_global_config(host="myhost", config_path=config_path)
+        assert cfg.workspace_id == "myhost"
+
+    def test_ai_peer_defaults_to_host_name(self, tmp_path):
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(json.dumps({"apiKey": "k", "enabled": True}))
+        cfg = HonchoClientConfig.from_global_config(host="myhost", config_path=config_path)
+        assert cfg.ai_peer == "myhost"
+
+    def test_dialectic_depth_levels_integration(self, tmp_path):
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(json.dumps({
+            "apiKey": "k", "enabled": True,
+            "hosts": {"hermes": {
+                "dialecticDepth": 3,
+                "dialecticDepthLevels": ["minimal", "low", "high"],
+                "enabled": True
+            }}
+        }))
+        cfg = HonchoClientConfig.from_global_config(host="hermes", config_path=config_path)
+        assert cfg.dialectic_depth == 3
+        assert cfg.dialectic_depth_levels == ["minimal", "low", "high"]
+
     def test_defaults_for_all_misc_fields(self, tmp_path):
         """Verify all defaults when only apiKey is set."""
         config_path = tmp_path / "honcho.json"
@@ -899,6 +969,51 @@ class TestFromGlobalConfigMiscFields:
         assert cfg.recall_mode == "hybrid"
         assert cfg.context_cadence == 1
         assert cfg.dialectic_cadence == 1
+        assert cfg.init_on_session_start is False
+        assert cfg.environment == "production"
+
+
+class TestRealBugsFound:
+    """Tests documenting REAL BUGS in the source code.
+
+    These are pinned as xfail(strict=True) so they fail the build
+    the moment the bug is fixed (prompting marker removal).
+    """
+
+    @pytest.mark.xfail(strict=True, reason="REAL BUG: host-level baseUrl ignored — source lines 536-541 only read raw, not host_block")
+    def test_host_base_url_should_win(self, tmp_path):
+        """Host-level baseUrl should override root, like every other field."""
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(json.dumps({
+            "apiKey": "k", "enabled": True,
+            "baseUrl": "http://root:8000",
+            "hosts": {"hermes": {"baseUrl": "http://host:9000", "enabled": True}}
+        }))
+        cfg = HonchoClientConfig.from_global_config(host="hermes", config_path=config_path)
+        assert cfg.base_url == "http://host:9000"
+
+    @pytest.mark.xfail(strict=True, reason="REAL BUG: writeFrequency=0 swallowed by `or` chain (0 is falsy)")
+    def test_write_frequency_zero_should_be_valid(self, tmp_path):
+        """writeFrequency=0 means 'never auto-write' — valid but swallowed."""
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(json.dumps({
+            "apiKey": "k", "enabled": True,
+            "hosts": {"hermes": {"writeFrequency": 0, "enabled": True}}
+        }))
+        cfg = HonchoClientConfig.from_global_config(host="hermes", config_path=config_path)
+        assert cfg.write_frequency == 0
+
+    def test_dialectic_reasoning_level_not_validated(self, tmp_path):
+        """DOCUMENTED GAP: any string passes through without validation.
+        Unlike recall_mode and observation_mode, no normalization occurs."""
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(json.dumps({
+            "apiKey": "k", "enabled": True,
+            "hosts": {"hermes": {"dialecticReasoningLevel": "BOGUS", "enabled": True}}
+        }))
+        cfg = HonchoClientConfig.from_global_config(host="hermes", config_path=config_path)
+        # This passes — documenting the gap (no validation)
+        assert cfg.dialectic_reasoning_level == "BOGUS"
 
 
 class TestSecurityNoKeyLeakage:
