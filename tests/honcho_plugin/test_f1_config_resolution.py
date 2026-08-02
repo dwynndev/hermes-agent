@@ -16,12 +16,17 @@ from plugins.memory.honcho.client import (
     HonchoClientConfig,
     _is_local_base_url,
     _normalize_recall_mode,
+    _normalize_observation_mode,
     _parse_context_tokens,
     _parse_dialectic_depth,
     _parse_dialectic_depth_levels,
     _parse_float_config,
     _parse_int_config,
+    _parse_string_map,
+    _parse_optional_string,
     _resolve_bool,
+    _resolve_observation,
+    _resolve_optional_float,
 )
 
 
@@ -197,6 +202,146 @@ class TestIsLocalBaseUrl:
     def test_none_and_empty(self):
         assert _is_local_base_url(None) is False
         assert _is_local_base_url("") is False
+
+
+class TestNormalizeObservationMode:
+    """_normalize_observation_mode: aliases + validation."""
+
+    def test_valid_modes(self):
+        assert _normalize_observation_mode("directional") == "directional"
+        assert _normalize_observation_mode("unified") == "unified"
+
+    def test_aliases(self):
+        assert _normalize_observation_mode("shared") == "unified"
+        assert _normalize_observation_mode("separate") == "directional"
+        assert _normalize_observation_mode("cross") == "directional"
+
+    def test_invalid_defaults_to_directional(self):
+        assert _normalize_observation_mode("bogus") == "directional"
+        assert _normalize_observation_mode("") == "directional"
+
+
+class TestResolveObservation:
+    """_resolve_observation: preset + granular override."""
+
+    def test_directional_preset_all_true(self):
+        result = _resolve_observation("directional", None)
+        assert result == {
+            "user_observe_me": True, "user_observe_others": True,
+            "ai_observe_me": True, "ai_observe_others": True,
+        }
+
+    def test_unified_preset(self):
+        result = _resolve_observation("unified", None)
+        assert result == {
+            "user_observe_me": True, "user_observe_others": False,
+            "ai_observe_me": False, "ai_observe_others": True,
+        }
+
+    def test_granular_overrides_preset(self):
+        obs = {"user": {"observeMe": False}, "ai": {"observeOthers": False}}
+        result = _resolve_observation("directional", obs)
+        assert result["user_observe_me"] is False
+        assert result["user_observe_others"] is True  # preset default
+        assert result["ai_observe_me"] is True  # preset default
+        assert result["ai_observe_others"] is False
+
+    def test_empty_observation_uses_preset(self):
+        result = _resolve_observation("unified", {})
+        assert result["ai_observe_me"] is False
+
+    def test_invalid_mode_falls_to_directional(self):
+        result = _resolve_observation("nonexistent", None)
+        assert result["user_observe_me"] is True
+        assert result["ai_observe_me"] is True
+
+
+class TestParseStringMap:
+    """_parse_string_map: host whole-map override, string coercion."""
+
+    def test_host_map_wins_whole(self):
+        host = {"userPeerAliases": {"111": "alice"}}
+        root = {"userPeerAliases": {"222": "bob"}}
+        result = _parse_string_map(host, root, "userPeerAliases")
+        assert result == {"111": "alice"}
+
+    def test_root_fallback(self):
+        host = {}
+        root = {"userPeerAliases": {"333": "carol"}}
+        result = _parse_string_map(host, root, "userPeerAliases")
+        assert result == {"333": "carol"}
+
+    def test_non_dict_returns_empty(self):
+        result = _parse_string_map({"userPeerAliases": "bad"}, {}, "userPeerAliases")
+        assert result == {}
+
+    def test_strips_whitespace(self):
+        host = {"userPeerAliases": {" 111 ": " alice "}}
+        result = _parse_string_map(host, {}, "userPeerAliases")
+        assert result == {"111": "alice"}
+
+    def test_empty_values_skipped(self):
+        host = {"userPeerAliases": {"111": "", "222": "bob"}}
+        result = _parse_string_map(host, {}, "userPeerAliases")
+        assert result == {"222": "bob"}
+
+    def test_none_value_becomes_empty_and_skipped(self):
+        host = {"userPeerAliases": {"111": None, "222": "bob"}}
+        result = _parse_string_map(host, {}, "userPeerAliases")
+        assert result == {"222": "bob"}
+
+
+class TestParseOptionalString:
+    """_parse_optional_string: host empty string overrides root."""
+
+    def test_host_wins(self):
+        result = _parse_optional_string({"key": "host"}, {"key": "root"}, "key")
+        assert result == "host"
+
+    def test_host_empty_string_overrides_root(self):
+        result = _parse_optional_string({"key": ""}, {"key": "root"}, "key")
+        assert result == ""
+
+    def test_root_fallback(self):
+        result = _parse_optional_string({}, {"key": "root"}, "key")
+        assert result == "root"
+
+    def test_default_when_missing(self):
+        result = _parse_optional_string({}, {}, "key", default="def")
+        assert result == "def"
+
+    def test_none_becomes_default(self):
+        result = _parse_optional_string({"key": None}, {}, "key", default="def")
+        assert result == "def"
+
+    def test_strips_whitespace(self):
+        result = _parse_optional_string({"key": "  val  "}, {}, "key")
+        assert result == "val"
+
+
+class TestResolveOptionalFloat:
+    """_resolve_optional_float: first positive wins."""
+
+    def test_first_positive_wins(self):
+        assert _resolve_optional_float(2.5, 9.9) == 2.5
+
+    def test_skips_none(self):
+        assert _resolve_optional_float(None, 3.14) == 3.14
+
+    def test_skips_zero_and_negative(self):
+        assert _resolve_optional_float(0, -1, 5.0) == 5.0
+
+    def test_string_coercion(self):
+        assert _resolve_optional_float("2.5") == 2.5
+
+    def test_empty_string_skipped(self):
+        assert _resolve_optional_float("", "3.0") == 3.0
+
+    def test_invalid_string_skipped(self):
+        assert _resolve_optional_float("abc", "4.0") == 4.0
+
+    def test_all_invalid_returns_none(self):
+        assert _resolve_optional_float(None, "abc", 0) is None
 
 
 # ---------------------------------------------------------------------------
@@ -511,6 +656,249 @@ class TestFromGlobalConfigEdgeCases:
         }))
         cfg = HonchoClientConfig.from_global_config(host="hermes", config_path=config_path)
         assert cfg.save_messages is False
+
+
+class TestFromGlobalConfigGatewayFields:
+    """Gateway identity fields: pinUserPeer, userPeerAliases, runtimePeerPrefix."""
+
+    def test_pin_user_peer_host_wins(self, tmp_path):
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(json.dumps({
+            "apiKey": "k", "enabled": True,
+            "pinUserPeer": False,
+            "hosts": {"hermes": {"pinUserPeer": True, "enabled": True}}
+        }))
+        cfg = HonchoClientConfig.from_global_config(host="hermes", config_path=config_path)
+        assert cfg.pin_peer_name is True
+
+    def test_pin_peer_name_legacy_alias(self, tmp_path):
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(json.dumps({
+            "apiKey": "k", "enabled": True,
+            "hosts": {"hermes": {"pinPeerName": True, "enabled": True}}
+        }))
+        cfg = HonchoClientConfig.from_global_config(host="hermes", config_path=config_path)
+        assert cfg.pin_peer_name is True
+
+    def test_user_peer_aliases(self, tmp_path):
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(json.dumps({
+            "apiKey": "k", "enabled": True,
+            "hosts": {"hermes": {
+                "userPeerAliases": {"7654321": "alice", "9999": "bob"},
+                "enabled": True
+            }}
+        }))
+        cfg = HonchoClientConfig.from_global_config(host="hermes", config_path=config_path)
+        assert cfg.user_peer_aliases == {"7654321": "alice", "9999": "bob"}
+
+    def test_runtime_peer_prefix(self, tmp_path):
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(json.dumps({
+            "apiKey": "k", "enabled": True,
+            "hosts": {"hermes": {"runtimePeerPrefix": "telegram_", "enabled": True}}
+        }))
+        cfg = HonchoClientConfig.from_global_config(host="hermes", config_path=config_path)
+        assert cfg.runtime_peer_prefix == "telegram_"
+
+    def test_default_gateway_fields(self, tmp_path):
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(json.dumps({"apiKey": "k", "enabled": True}))
+        cfg = HonchoClientConfig.from_global_config(host="hermes", config_path=config_path)
+        assert cfg.pin_peer_name is False
+        assert cfg.user_peer_aliases == {}
+        assert cfg.runtime_peer_prefix == ""
+
+
+class TestFromGlobalConfigObservation:
+    """Observation mode and per-peer toggles via from_global_config."""
+
+    def test_default_new_install_is_directional(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("HONCHO_API_KEY", raising=False)
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(json.dumps({"baseUrl": "http://localhost:8000"}))
+        cfg = HonchoClientConfig.from_global_config(host="hermes", config_path=config_path)
+        # New install (no host block, no explicit config) → directional
+        assert cfg.observation_mode == "directional"
+        assert cfg.user_observe_me is True
+        assert cfg.ai_observe_me is True
+
+    def test_explicitly_configured_defaults_to_unified(self, tmp_path):
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(json.dumps({
+            "apiKey": "k", "enabled": True,
+            "hosts": {"hermes": {"enabled": True}}
+        }))
+        cfg = HonchoClientConfig.from_global_config(host="hermes", config_path=config_path)
+        # Explicitly configured (host block exists) → unified (migration guard)
+        assert cfg.observation_mode == "unified"
+
+    def test_explicit_observation_mode_directional(self, tmp_path):
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(json.dumps({
+            "apiKey": "k", "enabled": True,
+            "hosts": {"hermes": {"observationMode": "directional", "enabled": True}}
+        }))
+        cfg = HonchoClientConfig.from_global_config(host="hermes", config_path=config_path)
+        assert cfg.observation_mode == "directional"
+        assert cfg.user_observe_me is True
+        assert cfg.user_observe_others is True
+        assert cfg.ai_observe_me is True
+        assert cfg.ai_observe_others is True
+
+    def test_granular_observation_overrides(self, tmp_path):
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(json.dumps({
+            "apiKey": "k", "enabled": True,
+            "hosts": {"hermes": {
+                "observationMode": "directional",
+                "observation": {"ai": {"observeMe": False}},
+                "enabled": True
+            }}
+        }))
+        cfg = HonchoClientConfig.from_global_config(host="hermes", config_path=config_path)
+        assert cfg.ai_observe_me is False
+        assert cfg.ai_observe_others is True  # preset default kept
+
+
+class TestFromGlobalConfigMiscFields:
+    """Remaining config fields: timeout, dialectic_dynamic, heuristic, etc."""
+
+    def test_timeout_from_host(self, tmp_path):
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(json.dumps({
+            "apiKey": "k", "enabled": True,
+            "hosts": {"hermes": {"timeout": 15.5, "enabled": True}}
+        }))
+        cfg = HonchoClientConfig.from_global_config(host="hermes", config_path=config_path)
+        assert cfg.timeout == 15.5
+
+    def test_timeout_from_env(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HONCHO_TIMEOUT", "22.0")
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(json.dumps({"apiKey": "k", "enabled": True}))
+        cfg = HonchoClientConfig.from_global_config(host="hermes", config_path=config_path)
+        assert cfg.timeout == 22.0
+
+    def test_dialectic_dynamic_false(self, tmp_path):
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(json.dumps({
+            "apiKey": "k", "enabled": True,
+            "hosts": {"hermes": {"dialecticDynamic": False, "enabled": True}}
+        }))
+        cfg = HonchoClientConfig.from_global_config(host="hermes", config_path=config_path)
+        assert cfg.dialectic_dynamic is False
+
+    def test_reasoning_heuristic_false(self, tmp_path):
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(json.dumps({
+            "apiKey": "k", "enabled": True,
+            "hosts": {"hermes": {"reasoningHeuristic": False, "enabled": True}}
+        }))
+        cfg = HonchoClientConfig.from_global_config(host="hermes", config_path=config_path)
+        assert cfg.reasoning_heuristic is False
+
+    def test_reasoning_level_cap(self, tmp_path):
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(json.dumps({
+            "apiKey": "k", "enabled": True,
+            "hosts": {"hermes": {"reasoningLevelCap": "max", "enabled": True}}
+        }))
+        cfg = HonchoClientConfig.from_global_config(host="hermes", config_path=config_path)
+        assert cfg.reasoning_level_cap == "max"
+
+    def test_dialectic_max_input_chars(self, tmp_path):
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(json.dumps({
+            "apiKey": "k", "enabled": True,
+            "hosts": {"hermes": {"dialecticMaxInputChars": 5000, "enabled": True}}
+        }))
+        cfg = HonchoClientConfig.from_global_config(host="hermes", config_path=config_path)
+        assert cfg.dialectic_max_input_chars == 5000
+
+    def test_injection_frequency(self, tmp_path):
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(json.dumps({
+            "apiKey": "k", "enabled": True,
+            "hosts": {"hermes": {"injectionFrequency": "first-turn", "enabled": True}}
+        }))
+        cfg = HonchoClientConfig.from_global_config(host="hermes", config_path=config_path)
+        assert cfg.injection_frequency == "first-turn"
+
+    def test_query_rewrite_true(self, tmp_path):
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(json.dumps({
+            "apiKey": "k", "enabled": True,
+            "hosts": {"hermes": {"queryRewrite": True, "enabled": True}}
+        }))
+        cfg = HonchoClientConfig.from_global_config(host="hermes", config_path=config_path)
+        assert cfg.query_rewrite is True
+
+    def test_first_turn_waits(self, tmp_path):
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(json.dumps({
+            "apiKey": "k", "enabled": True,
+            "hosts": {"hermes": {
+                "firstTurnBaseWait": 5.0,
+                "firstTurnDialecticWait": 4.0,
+                "enabled": True
+            }}
+        }))
+        cfg = HonchoClientConfig.from_global_config(host="hermes", config_path=config_path)
+        assert cfg.first_turn_base_wait == 5.0
+        assert cfg.first_turn_dialectic_wait == 4.0
+
+    def test_session_strategy(self, tmp_path):
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(json.dumps({
+            "apiKey": "k", "enabled": True,
+            "hosts": {"hermes": {"sessionStrategy": "global", "enabled": True}}
+        }))
+        cfg = HonchoClientConfig.from_global_config(host="hermes", config_path=config_path)
+        assert cfg.session_strategy == "global"
+
+    def test_context_tokens(self, tmp_path):
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(json.dumps({
+            "apiKey": "k", "enabled": True,
+            "hosts": {"hermes": {"contextTokens": 4096, "enabled": True}}
+        }))
+        cfg = HonchoClientConfig.from_global_config(host="hermes", config_path=config_path)
+        assert cfg.context_tokens == 4096
+
+    def test_peer_name_and_ai_peer(self, tmp_path):
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(json.dumps({
+            "apiKey": "k", "enabled": True,
+            "peerName": "eri",
+            "hosts": {"hermes": {"aiPeer": "coder", "enabled": True}}
+        }))
+        cfg = HonchoClientConfig.from_global_config(host="hermes", config_path=config_path)
+        assert cfg.peer_name == "eri"
+        assert cfg.ai_peer == "coder"
+
+    def test_defaults_for_all_misc_fields(self, tmp_path):
+        """Verify all defaults when only apiKey is set."""
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(json.dumps({"apiKey": "k", "enabled": True}))
+        cfg = HonchoClientConfig.from_global_config(host="hermes", config_path=config_path)
+        assert cfg.timeout is None
+        assert cfg.dialectic_dynamic is True
+        assert cfg.reasoning_heuristic is True
+        assert cfg.reasoning_level_cap == "high"
+        assert cfg.dialectic_max_input_chars == 10000
+        assert cfg.injection_frequency == "every-turn"
+        assert cfg.query_rewrite is False
+        assert cfg.first_turn_base_wait == 3.0
+        assert cfg.first_turn_dialectic_wait == 2.0
+        assert cfg.session_strategy == "per-directory"
+        assert cfg.context_tokens is None
+        assert cfg.dialectic_max_chars == 600
+        assert cfg.message_max_chars == 25000
+        assert cfg.dialectic_reasoning_level == "low"
+        assert cfg.recall_mode == "hybrid"
+        assert cfg.context_cadence == 1
+        assert cfg.dialectic_cadence == 1
 
 
 class TestSecurityNoKeyLeakage:
