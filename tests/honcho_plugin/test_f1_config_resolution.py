@@ -113,6 +113,15 @@ class TestParseFloatConfig:
     def test_invalid_falls_through(self):
         assert _parse_float_config("bad", "3.14", default=1.0) == 3.14
 
+    def test_string_coercion(self):
+        assert _parse_float_config("2.5", None, default=1.0) == 2.5
+
+    def test_root_fallback(self):
+        assert _parse_float_config(None, 7.7, default=1.0) == 7.7
+
+    def test_both_none_returns_default(self):
+        assert _parse_float_config(None, None, default=3.3) == 3.3
+
 
 class TestParseContextTokens:
     """_parse_context_tokens: None means uncapped."""
