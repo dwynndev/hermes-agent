@@ -71,8 +71,6 @@ class TestCostModel:
 
     def test_tools_mode_zero_auto_calls(self):
         """recallMode=tools → 0 automatic API calls per turn."""
-        from plugins.memory.honcho import HonchoMemoryProvider
-
         cfg = _load_honcho_json()
         host = cfg.get("hosts", {}).get("hermes", {})
         recall_mode = host.get("recallMode", "hybrid")

@@ -67,13 +67,21 @@ class TestMultiHostConfig:
 class TestGatewayMode:
     """Test gateway/cron mode detection."""
 
-    def test_cron_skipped_flag_defaults_false(self):
-        """Provider instance has _cron_skipped=False by default (non-gateway)."""
+    def test_cron_skipped_is_instance_level(self):
+        """_cron_skipped is per-instance, not a class attribute (multi-provider isolation)."""
         from plugins.memory.honcho import HonchoMemoryProvider
 
-        p = HonchoMemoryProvider.__new__(HonchoMemoryProvider)
-        p._cron_skipped = False  # simulates __init__ default
-        assert p._cron_skipped is False
+        # Class itself should NOT have _cron_skipped as a class attribute
+        assert not hasattr(HonchoMemoryProvider, '_cron_skipped') or \
+            '_cron_skipped' not in HonchoMemoryProvider.__dict__
+
+        # Two instances can have different values
+        p1 = HonchoMemoryProvider.__new__(HonchoMemoryProvider)
+        p2 = HonchoMemoryProvider.__new__(HonchoMemoryProvider)
+        p1._cron_skipped = True
+        p2._cron_skipped = False
+        assert p1._cron_skipped is True
+        assert p2._cron_skipped is False
 
     def test_gateway_mode_disables_auto_inject(self):
         """In gateway/cron mode, auto-inject is disabled."""
@@ -116,7 +124,6 @@ class TestGatewayMode:
         p._stale_multiplier = 2.0
         p._manager = MagicMock()
         p._session_key = "test:session"
-        p._session_ready = True
 
         result = p.system_prompt_block()
         # hybrid mode returns static tool instructions (not context — that's prefetch)
