@@ -6585,6 +6585,14 @@ class AIAgent:
             return True
         if base_url_host_matches(self._base_url_lower, "ai-gateway.vercel.sh"):
             return True
+        # Alibaba DashScope / QwenCloud Token Plan: the compatible-mode endpoint
+        # honors extra_body.reasoning = {"enabled": True, "effort": <level>} for
+        # qwen3 reasoning models (verified live 2026-07-30: nested reasoning
+        # raises reasoning_content ~48% vs baseline). Top-level reasoning_effort
+        # with "ultra" is rejected (HTTP 400); valid = none,minimal,low,medium,
+        # high,xhigh,max.
+        if base_url_host_matches(self._base_url_lower, "aliyuncs.com"):
+            return True
         if (
             base_url_host_matches(self._base_url_lower, "models.github.ai")
             or base_url_host_matches(self._base_url_lower, "githubcopilot.com")
