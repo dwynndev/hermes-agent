@@ -4,7 +4,7 @@ Tests the full stack: API health, workspace/peer/session CRUD, message
 ingestion, context retrieval, peer card, search. Requires honcho-selfhost
 running on localhost:8000 (docker compose up -d).
 
-Skip if server not available: pytest -m "not e2e" to exclude.
+Skip if server not available: tests auto-skip via the _server_available() guard.
 """
 
 import json
@@ -14,8 +14,8 @@ import urllib.error
 
 import pytest
 
-# Mark all tests in this module as e2e + allow_network (bypasses conftest network guard)
-pytestmark = [pytest.mark.e2e, pytest.mark.allow_network]
+# allow_network bypasses the conftest network guard (registered in conftest.py)
+pytestmark = pytest.mark.allow_network
 
 BASE_URL = "http://localhost:8000"
 
