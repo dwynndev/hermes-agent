@@ -87,6 +87,24 @@ class TestErrorLedgerFormatter:
         line = ErrorLedgerFormatter().format(rec)
         entry = json.loads(line)
         assert entry.get("truncated") is True
+
+    def test_clipped_record_always_fits_atomic_bound(self):
+        # Regression: first-stage clipping alone didn't re-check the bound —
+        # a huge extra=detail field kept the line above _MAX_RECORD_BYTES,
+        # breaking the documented O_APPEND atomicity invariant.
+        rec = _make_record("y" * 10_000)
+        rec.error_detail = "z" * 10_000
+        try:
+            raise RuntimeError("w" * 5_000)
+        except RuntimeError:
+            import sys
+
+            rec.exc_info = sys.exc_info()
+        line = ErrorLedgerFormatter().format(rec)
+        assert len(line.encode("utf-8")) <= 4000
+        entry = json.loads(line)
+        assert entry.get("truncated") is True
+        assert "detail" not in entry  # dropped in the second reduction stage
         assert len(line.encode("utf-8")) <= 4096  # PIPE_BUF-safe bound
 
 

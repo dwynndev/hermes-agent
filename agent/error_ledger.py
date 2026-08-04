@@ -87,13 +87,24 @@ class ErrorLedgerFormatter(logging.Formatter):
         line = redact_sensitive_text(line)
 
         # Atomic-append guard: clip oversized records (tracebacks dominate).
+        # Progressive reduction — each step is re-checked so the invariant
+        # "every emitted line fits _MAX_RECORD_BYTES" always holds, even with
+        # a huge detail/message field.
         encoded = line.encode("utf-8", errors="replace")
         if len(encoded) > _MAX_RECORD_BYTES:
             payload["traceback"] = (payload.get("traceback") or "")[:800]
             payload["message"] = payload["message"][:400]
             payload["truncated"] = True
-            line = json.dumps(payload, ensure_ascii=False, default=str)
-            line = redact_sensitive_text(line)
+            line = redact_sensitive_text(
+                json.dumps(payload, ensure_ascii=False, default=str)
+            )
+            if len(line.encode("utf-8", errors="replace")) > _MAX_RECORD_BYTES:
+                payload.pop("detail", None)
+                payload["traceback"] = (payload.get("traceback") or "")[:200]
+                payload["message"] = payload["message"][:150]
+                line = redact_sensitive_text(
+                    json.dumps(payload, ensure_ascii=False, default=str)
+                )
         return line
 
 
