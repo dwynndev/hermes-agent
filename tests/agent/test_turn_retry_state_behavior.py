@@ -5,11 +5,10 @@ the semantics the turn loop actually relies on:
 
 * every fresh instance starts with ALL guards False — a leaked True would
   silently skip a recovery branch forever (the loop checks-then-sets)
-* instances are independent (dataclass default values are not shared state)
-* __iter__ yields exactly (name, value) pairs for every field — the
-  debugging/dump contract, and the basis for any future "reset all guards"
-  tooling
-* restart signals and auth guards are orthogonal flag groups (no coupling)
+* instances are independent (no shared/aliased state across attempts)
+* __iter__ yields exactly (name, value) tuples for every field — the
+  debugging/dump contract
+* the one-shot check-then-set pattern fires its recovery exactly once
 """
 
 from __future__ import annotations
@@ -18,24 +17,6 @@ from dataclasses import fields
 
 from agent.turn_retry_state import TurnRetryState
 
-GUARD_FIELDS = {
-    "codex_auth_retry_attempted",
-    "anthropic_auth_retry_attempted",
-    "nous_auth_retry_attempted",
-    "nous_paid_entitlement_refresh_attempted",
-    "copilot_auth_retry_attempted",
-    "copilot_stale_cred_retry_attempted",
-    "vertex_auth_retry_attempted",
-    "thinking_sig_retry_attempted",
-    "invalid_encrypted_content_retry_attempted",
-    "image_shrink_retry_attempted",
-    "multimodal_tool_content_retry_attempted",
-    "oauth_1m_beta_retry_attempted",
-    "llama_cpp_grammar_retry_attempted",
-    "primary_recovery_attempted",
-    "has_retried_429",
-    "auth_failover_attempted",
-}
 RESTART_FIELDS = {
     "restart_with_compressed_messages",
     "restart_with_length_continuation",
@@ -59,6 +40,8 @@ class TestFreshInstanceDefaults:
 
 class TestInstanceIndependence:
     def test_mutation_does_not_leak_across_instances(self):
+        # Would catch a mutable-class-default bug (shared dict/list) if a
+        # future field type changed — and a __post_init__ that aliases state.
         a = TurnRetryState()
         b = TurnRetryState()
         a.has_retried_429 = True
@@ -66,26 +49,20 @@ class TestInstanceIndependence:
         assert b.has_retried_429 is False
         assert b.restart_with_compressed_messages is False
 
-    def test_each_turn_gets_a_clean_slate(self):
-        # Simulates the loop creating a fresh state per api_call_count.
-        for _ in range(3):
-            s = TurnRetryState()
-            s.auth_failover_attempted = True
-            s.restart_with_redirected_messages = True
-        s2 = TurnRetryState()
-        assert s2.auth_failover_attempted is False
-        assert s2.restart_with_redirected_messages is False
-
 
 class TestIterationProtocol:
-    def test_iter_yields_name_value_pairs_for_every_field(self):
+    def test_iter_yields_name_value_tuples_for_every_field(self):
+        # Pins the (name, value) TUPLE contract: dict() over the iterator
+        # works only if each item is a 2-element sequence. A __iter__ that
+        # yielded bare names, or (value, name) pairs, fails here.
         s = TurnRetryState()
         s.copilot_stale_cred_retry_attempted = True
-        pairs = dict(s)
+        pairs = list(s)
+        assert all(isinstance(p, tuple) and len(p) == 2 for p in pairs)
+        assert dict(pairs) == dict(s)
         expected_names = {f.name for f in fields(TurnRetryState)}
-        assert set(pairs) == expected_names
-        assert pairs["copilot_stale_cred_retry_attempted"] is True
-        assert pairs["has_retried_429"] is False
+        assert {name for name, _ in pairs} == expected_names
+        assert dict(pairs)["copilot_stale_cred_retry_attempted"] is True
 
     def test_iter_reflects_live_mutation(self):
         s = TurnRetryState()
@@ -95,14 +72,25 @@ class TestIterationProtocol:
         assert before is False and after is True
 
 
-class TestFlagOrthogonality:
-    def test_auth_guard_and_restart_signal_do_not_interfere(self):
-        # The loop sets auth guards on escalation and restart signals on
-        # rebuild; they must be independently writable/readable.
+class TestOneShotGuardPattern:
+    def test_check_then_set_fires_exactly_once(self):
+        # The turn loop's actual usage pattern for every guard:
+        #     if not state.X:
+        #         state.X = True
+        #         <recovery branch>
+        # The recovery must execute exactly once per attempt regardless of
+        # how many times the branch condition is re-encountered. A guard
+        # that reset itself (or a field read that didn't persist the write)
+        # would fire the recovery repeatedly — this catches that.
         s = TurnRetryState()
-        for name in sorted(GUARD_FIELDS):
-            setattr(s, name, True)
-        assert all(getattr(s, n) is False for n in RESTART_FIELDS)
-        for name in RESTART_FIELDS:
-            setattr(s, name, True)
-        assert all(getattr(s, n) is True for n in GUARD_FIELDS)
+        fires = 0
+        for _ in range(3):  # loop re-encounters the branch 3 times
+            if not s.thinking_sig_retry_attempted:
+                s.thinking_sig_retry_attempted = True
+                fires += 1
+        assert fires == 1
+        assert s.thinking_sig_retry_attempted is True
+        # Other guards in the same attempt are untouched — the loop may
+        # still fire them later within this attempt.
+        assert s.has_retried_429 is False
+        assert s.restart_with_compressed_messages is False

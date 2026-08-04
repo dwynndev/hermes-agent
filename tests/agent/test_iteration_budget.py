@@ -80,13 +80,17 @@ class TestThreadSafety:
         assert b.remaining == 0
 
     def test_concurrent_consume_refund_stays_consistent(self):
+        # Stress: concurrent consume/refund must never push the counter
+        # outside [0, max_total] and must not deadlock/crash. Exact
+        # conservation is pinned by the deterministic ledger test below —
+        # asserting remaining's own formula here would be a tautology.
         b = IterationBudget(max_total=100)
         errors: list[str] = []
 
         def consumer():
             for _ in range(200):
-                if b.consume() and b.remaining < 0:
-                    errors.append("remaining went negative")
+                if b.consume() and not (0 <= b.remaining <= 100):
+                    errors.append("remaining out of bounds")
 
         def refunder():
             for _ in range(100):
@@ -101,4 +105,25 @@ class TestThreadSafety:
 
         assert not errors
         assert 0 <= b.used <= 100
-        assert b.remaining == max(0, 100 - b.used)
+
+    def test_deterministic_ledger_conservation(self):
+        # Independently computed expected ledger: refund is a clamped no-op
+        # at zero, so a mixed op sequence must land the counter exactly on
+        # the net of effective operations. Catches lost updates, a missing
+        # clamp, or a wrong comparison — none of which the property formulas
+        # alone would reveal.
+        b = IterationBudget(max_total=3)
+        ops = ["c", "c", "r", "c", "r", "r", "r", "c", "c", "r"]
+        expected = 0
+        for op in ops:
+            if op == "c":
+                allowed = expected < 3
+                assert b.consume() is allowed
+                if allowed:
+                    expected += 1
+            else:
+                b.refund()
+                expected = max(0, expected - 1)
+            assert b.used == expected
+        # Net: 5 allowed consumes - 4 effective refunds (one clamped) = 1.
+        assert b.used == 1 and b.remaining == 2
