@@ -588,7 +588,12 @@ class CredentialPool:
         self._entries = sorted(entries, key=lambda entry: entry.priority)
         self._current_id: Optional[str] = None
         self._strategy = get_pool_strategy(provider)
-        self._lock = threading.Lock()
+        # RLock: the mutation primitives below (_replace_entry/_persist)
+        # self-acquire this lock so the quarantine paths in
+        # _refresh_entry_impl can atomically read-modify-write self._entries
+        # even when called outside the pool lock. In-lock callers re-acquire
+        # reentrantly at negligible cost. (Upstream 687dd632a1.)
+        self._lock = threading.RLock()
         self._active_leases: Dict[str, int] = {}
         self._max_concurrent = DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL
         # Monotonic timestamp of the last "no available entries" log, used to
@@ -656,18 +661,28 @@ class CredentialPool:
             return matches[0].id if len(matches) == 1 else None
 
     def _replace_entry(self, old: PooledCredential, new: PooledCredential) -> None:
-        """Swap an entry in-place by id, preserving sort order."""
-        for idx, entry in enumerate(self._entries):
-            if entry.id == old.id:
-                self._entries[idx] = new
-                return
+        """Swap an entry in-place by id, preserving sort order.
+
+        Self-locking (RLock) so callers running outside the pool lock cannot
+        tear ``self._entries`` against a concurrent select()/rotation.
+        (Upstream 687dd632a1.)
+        """
+        with self._lock:
+            for idx, entry in enumerate(self._entries):
+                if entry.id == old.id:
+                    self._entries[idx] = new
+                    return
 
     def _persist(self, *, removed_ids: Optional[List[str]] = None) -> None:
-        write_credential_pool(
-            self.provider,
-            [entry.to_dict() for entry in self._entries],
-            removed_ids=removed_ids,
-        )
+        # Self-locking (RLock): snapshotting self._entries must not race a
+        # concurrent rotation when called from outside the pool lock.
+        # (Upstream 687dd632a1.)
+        with self._lock:
+            write_credential_pool(
+                self.provider,
+                [entry.to_dict() for entry in self._entries],
+                removed_ids=removed_ids,
+            )
 
     def _is_terminal_auth_failure(
         self,
@@ -1415,17 +1430,21 @@ class CredentialPool:
                         logger.debug(
                             "Failed to clear terminal xAI OAuth state: %s", clear_exc
                         )
-                    removed_ids = [
-                        item.id for item in self._entries
-                        if item.source == "device_code"
-                    ]
-                    self._entries = [
-                        item for item in self._entries
-                        if item.source != "device_code"
-                    ]
-                    if self._current_id == entry.id:
-                        self._current_id = None
-                    self._persist(removed_ids=removed_ids)
+                    # Atomic read-modify-write of self._entries under the pool
+                    # lock (RLock: re-entrant for already-locked callers).
+                    # Upstream 4075c8fd5a.
+                    with self._lock:
+                        removed_ids = [
+                            item.id for item in self._entries
+                            if item.source == "device_code"
+                        ]
+                        self._entries = [
+                            item for item in self._entries
+                            if item.source != "device_code"
+                        ]
+                        if self._current_id == entry.id:
+                            self._current_id = None
+                        self._persist(removed_ids=removed_ids)
                     return None
             # For openai-codex: same race as xAI/nous — another Hermes process
             # may have consumed the refresh token between our proactive sync
@@ -1485,17 +1504,21 @@ class CredentialPool:
                         logger.debug(
                             "Failed to clear terminal Codex OAuth state: %s", clear_exc
                         )
-                    removed_ids = [
-                        item.id for item in self._entries
-                        if item.source == "device_code"
-                    ]
-                    self._entries = [
-                        item for item in self._entries
-                        if item.source != "device_code"
-                    ]
-                    if self._current_id == entry.id:
-                        self._current_id = None
-                    self._persist(removed_ids=removed_ids)
+                    # Atomic read-modify-write of self._entries under the pool
+                    # lock (RLock: re-entrant for already-locked callers).
+                    # Upstream 4075c8fd5a.
+                    with self._lock:
+                        removed_ids = [
+                            item.id for item in self._entries
+                            if item.source == "device_code"
+                        ]
+                        self._entries = [
+                            item for item in self._entries
+                            if item.source != "device_code"
+                        ]
+                        if self._current_id == entry.id:
+                            self._current_id = None
+                        self._persist(removed_ids=removed_ids)
                     return None
             # For nous: another process may have consumed the refresh token
             # between our proactive sync and the HTTP call.  Re-sync from
@@ -1552,17 +1575,21 @@ class CredentialPool:
                         auth_mod.NOUS_DEVICE_CODE_SOURCE,
                         f"manual:{auth_mod.NOUS_DEVICE_CODE_SOURCE}",
                     }
-                    removed_ids = [
-                        item.id for item in self._entries
-                        if item.source in singleton_sources
-                    ]
-                    self._entries = [
-                        item for item in self._entries
-                        if item.source not in singleton_sources
-                    ]
-                    if self._current_id == entry.id:
-                        self._current_id = None
-                    self._persist(removed_ids=removed_ids)
+                    # Atomic read-modify-write of self._entries under the pool
+                    # lock (RLock: re-entrant for already-locked callers).
+                    # Upstream 4075c8fd5a.
+                    with self._lock:
+                        removed_ids = [
+                            item.id for item in self._entries
+                            if item.source in singleton_sources
+                        ]
+                        self._entries = [
+                            item for item in self._entries
+                            if item.source not in singleton_sources
+                        ]
+                        if self._current_id == entry.id:
+                            self._current_id = None
+                        self._persist(removed_ids=removed_ids)
                     return None
             self._mark_exhausted(entry, None)
             return None
