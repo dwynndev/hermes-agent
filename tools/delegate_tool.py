@@ -31,7 +31,8 @@ from tools.delegate_tool_config import (  # noqa: F401
     _DEFAULT_MAX_CONCURRENT_CHILDREN, _get_child_timeout, _get_max_async_children, _get_max_concurrent_children,
     _get_max_spawn_depth, _get_orchestrator_enabled, _get_subagent_approval_callback, _get_worktree_isolation,
     _inherit_parent_capabilities, _load_config, _merge_request_overrides, _resolve_child_credential_pool,
-    _resolve_child_runtime, _resolve_delegation_credentials, _subagent_auto_approve, _subagent_auto_deny,
+    _resolve_child_reasoning, _resolve_child_runtime, _resolve_delegation_credentials, _subagent_auto_approve,
+    _subagent_auto_deny,
 )
 from tools.delegate_tool_dispatch import _Batch, _announce_batch, _capture_origin, _run_batch
 from tools.delegate_tool_progress import (  # noqa: F401
@@ -45,7 +46,7 @@ from tools.delegate_tool_registry import (  # noqa: F401
     get_subagent_attribution, interrupt_subagent, is_spawn_paused, list_active_subagents, set_spawn_paused,
     steer_subagent,
 )
-from tools.delegate_tool_tasks import _coerce_task_schemas, _normalize_task_list
+from tools.delegate_tool_tasks import _coerce_task_schemas, _normalize_task_list, _validate_batch_tasks
 from tools.delegate_tool_toolsets import (  # noqa: F401
     DELEGATE_BLOCKED_TOOLS, _expand_parent_toolsets, _resolve_child_toolsets, _strip_blocked_tools,
 )
@@ -54,6 +55,41 @@ from tools.delegate_tool_results import (  # noqa: F401
 )
 
 _ROLES = frozenset({"leaf", "orchestrator"})
+
+# Wave 12 (AS-0018 two-model division of labor): the ONLY models a caller may
+# pin per-task via the optional `model` parameter. Mirrors
+# scripts/model_policy_audit.py ALLOWED_MODELS in the consuming harness. A
+# hardcoded frozenset (not a config key) keeps the core policy-neutral: which
+# models are allowed is a deployment policy the audit already enforces — the
+# core only needs a closed set to reject typos/foreign models loudly instead
+# of silently spawning a child that can never be billed or routed.
+# AS-0025 (Wave 40): quad-model allowlist — qwen3.8-flash added as NARROW
+# tool-assisted worker (role boundaries enforced by the harness audit layer).
+ALLOWED_WORKER_MODELS = frozenset({"qwen3.8-max", "deepseek-v4-flash-0731", "deepseek-v4-pro-0813", "qwen3.8-flash"})
+
+
+def _validate_worker_model(model: Any) -> Optional[str]:
+    """Validate an optional per-task / top-level `model` override.
+
+    Returns None when the value is absent (no override) or allowed, otherwise
+    an actionable error string. Reject-over-silent-fallback by design: a typo
+    in a model name must fail the whole call before any child is spawned.
+    """
+    if model is None:
+        return None
+    if not isinstance(model, str) or not model.strip():
+        return (
+            f"delegate_task: 'model' must be a non-empty string, got {model!r}. "
+            f"Allowed models: {sorted(ALLOWED_WORKER_MODELS)}."
+        )
+    name = model.strip()
+    if name not in ALLOWED_WORKER_MODELS:
+        return (
+            f"delegate_task: model {name!r} is not allowed. Allowed models: "
+            f"{sorted(ALLOWED_WORKER_MODELS)} (tri-model policy AS-0020, "
+            "supersedes AS-0016/AS-0018)."
+        )
+    return None
 
 # Nested delegation is granted by depth/role in _build_child_agent, never by the
 # model naming toolsets (there is no model-facing toolsets argument).
@@ -322,7 +358,11 @@ def _build_children(
             child = _build_child_preserving_parent_tools(
                 task_index=i, goal=t["goal"], context=_child_context,
                 toolsets=None,  # always inherit the parent's toolsets
-                model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
+                # Wave 12 (AS-0018): optional per-task model pin (validated in
+                # _validate_batch_tasks / top-level check above) beats the global
+                # delegation.model for this child only. Absent → delegation.model.
+                model=(str(t.get("model")).strip() if t.get("model") else None) or creds["model"],
+                max_iterations=max_iterations, task_count=len(task_list),
                 parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
             )
         except ValueError as exc:
@@ -350,11 +390,17 @@ def delegate_task(
     max_iterations: Optional[int] = None, role: Optional[str] = None, background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None, action: Optional[str] = None, subagent_id: Optional[str] = None,
     message: Optional[str] = None, parent_agent=None, credentials_cfg: Optional[Dict[str, Any]] = None,
+    model: Optional[str] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
     (per-task beats top-level; capability is depth-derived). Returns JSON with one results entry per task, or a
-    dispatch handle when running in the background."""
+    dispatch handle when running in the background.
+
+    The optional 'model' parameter (top-level or per task item, per-task
+    wins) overrides delegation.model for those children only. Restricted
+    to ALLOWED_WORKER_MODELS; invalid values reject the whole call before
+    any child is spawned (Wave 12, AS-0018)."""
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
 
@@ -396,6 +442,11 @@ def delegate_task(
         )
     # credentials_cfg (internal callers only, e.g. /review → auxiliary.review) is
     # a per-call override shaped like the delegation config section.
+    # Wave 12 (AS-0018): validate the optional top-level model pin first — a
+    # foreign model must reject the whole call before any child is spawned.
+    top_model_err = _validate_worker_model(model)
+    if top_model_err:
+        return tool_error(top_model_err)
     try:
         creds = _resolve_delegation_credentials(credentials_cfg if credentials_cfg else cfg, parent_agent)
     except ValueError as exc:
@@ -404,6 +455,16 @@ def delegate_task(
         return tool_error(str(exc))
     max_children = _get_max_concurrent_children()
     task_list, err = _normalize_task_list(goal, context, tasks, output_schema, top_role, max_children)
+    if not err:
+        # Wave 12 (AS-0018): top-level model applies to the single-goal
+        # form (batch form uses per-task model pins only, matching the
+        # "top-level goal/context/role are ignored" batch semantics).
+        if (
+            model is not None and str(model).strip()
+            and (tasks is None or (isinstance(tasks, list) and not tasks))
+            and task_list
+        ):
+            task_list[0]["model"] = str(model).strip()
     if not err:
         task_schemas, err = _coerce_task_schemas(task_list, output_schema)
     if err:
@@ -478,7 +539,10 @@ _DESCRIPTION_HEAD = (
     "succeeded.\n"
 )
 _DESCRIPTION_TAIL = (
-    "- Children inherit the parent model unless pinned via delegation.provider / delegation.model in config.yaml."
+    "- Children inherit the parent model unless pinned via delegation.provider / delegation.model in config.yaml. "
+    "An optional top-level 'model' parameter (single-goal form) or per-task 'model' field (batch form) overrides "
+    "the child model for those children only — restricted to the configured worker-model policy allowlist; "
+    "invalid values reject the whole call before any child is spawned."
 )
 
 def _build_tasks_param_description() -> str:
@@ -546,6 +610,13 @@ DELEGATE_TASK_SCHEMA = {
                             "schema_valid, plus schema_errors on failure). Keep it forgiving — require only "
                             "fields you will read.",
                         ),
+                        "model": _p(
+                            "string",
+                            "Optional model pin for THIS task only — overrides delegation.model for this child. "
+                            "Must be one of the allowed worker models (validated against the worker-model policy "
+                            "allowlist); invalid values reject the whole call before any child is spawned. Use to "
+                            "run specific children (e.g. reviewers) on a different model than the worker default.",
+                        ),
                     },
                     "required": ["goal"],
                 },
@@ -553,6 +624,13 @@ DELEGATE_TASK_SCHEMA = {
             },
             # `background` (bool) is also accepted — DEPRECATED, ignored: top-level
             # delegations always run in the background. Unadvertised; do not re-add.
+            "model": _p(
+                "string",
+                "Optional model pin for the single-goal form — overrides delegation.model for this child. "
+                "Must be one of the allowed worker models (validated against the worker-model policy allowlist); "
+                "invalid values reject the whole call before any child is spawned. In batch mode use the "
+                "per-task 'model' field instead (this top-level value is ignored for batches).",
+            ),
             "action": _p(
                 "string",
                 "Default 'spawn'. Live control of running children: "
@@ -604,7 +682,7 @@ registry.register(
         max_iterations=args.get("max_iterations"), role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
         action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
-        parent_agent=kw.get("parent_agent"),
+        parent_agent=kw.get("parent_agent"), model=args.get("model"),
     ),
     check_fn=check_delegate_requirements,
     emoji="🔀",

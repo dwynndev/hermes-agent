@@ -62,6 +62,12 @@ def _validate_batch_tasks(task_list: List[Dict[str, Any]]) -> Optional[str]:
                 f"self-contained goal of at least {_MIN_BATCH_GOAL_LEN} characters so the subagent knows "
                 "exactly what to do."
             )
+        # Wave 12 (AS-0018): optional per-task model pin — validate against
+        # the worker-model allowlist before ANY child is spawned.
+        from tools.delegate_tool import _validate_worker_model
+        model_err = _validate_worker_model(task.get("model"))
+        if model_err:
+            return f"Task {i}: {model_err}"
     return None
 
 def _normalize_task_list(

@@ -357,13 +357,67 @@ def _runtime_provider_credentials(v: dict, explicit_request_overrides) -> dict:
         runtime.get("max_output_tokens"), command=pinned_command, args=list(runtime.get("args") or []),
     )
 
-def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
+def _resolve_child_reasoning(
+    delegation_cfg: dict,
+    full_cfg: dict,
+    effective_model: Optional[str],
+    parent_reasoning: Optional[dict],
+) -> Optional[dict]:
+    """Resolve the reasoning config for a delegation child (Wave 12, AS-0018).
+
+    Priority:
+    1. Explicit ``delegation.reasoning_effort`` (a YAML boolean ``False``
+       means thinking disabled — kept raw so it never silently re-enables;
+       an operator pin wins for ALL children, backward compatible).
+    2. ``agent.reasoning_overrides[<effective child model>]`` via the shared
+       spelling-tolerant chokepoint — flash workers get the flash override,
+       per-task-pinned qwen reviewers keep the max override.
+    3. ``agent.reasoning_effort`` global.
+    4. Parent reasoning config (inherit).
+    """
+    from hermes_constants import (
+        parse_reasoning_effort,
+        resolve_per_model_reasoning_effort,
+    )
+
+    delegation_effort = delegation_cfg.get("reasoning_effort")
+    if delegation_effort or delegation_effort is False:
+        parsed = parse_reasoning_effort(delegation_effort)
+        if parsed is not None:
+            return parsed
+        logger.warning(
+            "Unknown delegation.reasoning_effort '%s', falling back to "
+            "per-model resolution",
+            delegation_effort,
+        )
+    if isinstance(full_cfg, dict):
+        agent_cfg = full_cfg.get("agent")
+        if isinstance(agent_cfg, dict):
+            overrides = agent_cfg.get("reasoning_overrides") or {}
+            per_model = resolve_per_model_reasoning_effort(
+                effective_model or "", overrides
+            )
+            if per_model is not None:
+                return per_model
+            parsed_global = parse_reasoning_effort(agent_cfg.get("reasoning_effort"))
+            if parsed_global is not None:
+                return parsed_global
+    return parent_reasoning
+
+
+def _resolve_delegation_credentials(cfg: dict, parent_agent, model_override: Optional[str] = None) -> dict:
     """Child credential bundle from the ``delegation`` config section. Three branches: ``base_url`` set → direct
     endpoint (``api_key`` None means inherit the parent's key, so providers keyed outside OPENAI_API_KEY work);
     ``provider`` set → full bundle via the runtime provider system (same path as CLI/gateway startup); neither →
     None values, child inherits everything. ``request_overrides`` is honored on every branch. Raises ValueError
     with a user-facing message."""
     values = {k: str(cfg.get(k) or "").strip() or None for k in ("model", "provider", "base_url", "api_key")}
+    # Wave 12 (AS-0018): a validated per-task / top-level model pin wins over
+    # delegation.model for the resolved credential bundle. Credentials
+    # (base_url/api_key/api_mode) still come from delegation.* — the worker
+    # policy keeps all allowed models on the same provider endpoint.
+    if model_override is not None and str(model_override).strip():
+        values["model"] = str(model_override).strip()
     values["api_mode"] = str(cfg.get("api_mode") or "").strip().lower() or None
     explicit_request_overrides = cfg.get("request_overrides") if isinstance(cfg.get("request_overrides"), dict) else None
     is_native_sdk_provider = (values["provider"] or "").strip().lower() in _NATIVE_SDK_PROVIDERS
@@ -464,20 +518,29 @@ def _resolve_child_runtime(
         # Forced ACP transport requires provider copilot-acp for run_agent to init the client.
         effective_provider, effective_api_mode = "copilot-acp", "chat_completions"
 
-    # Reasoning: delegation.reasoning_effort > parent. Keep the raw value — a
-    # YAML ``false`` must disable thinking, not coerce to "" and inherit.
-    child_reasoning = getattr(parent_agent, "reasoning_config", None)
+    # Reasoning (Wave 12, AS-0018): explicit delegation.reasoning_effort
+    # (incl. YAML false = thinking off) > agent.reasoning_overrides[<effective
+    # child model>] — the per-model chokepoint, so a flash worker resolves to
+    # the flash override while a per-task-pinned qwen reviewer child keeps its
+    # own override — > agent.reasoning_effort global > parent inherit.
+    # Replaces the old single delegation.reasoning_effort-for-all-children
+    # behavior; an explicit operator pin still wins for ALL children
+    # (backward compatible). Keep raw values — a YAML ``false`` must disable
+    # thinking, not coerce to "" and inherit.
+    parent_reasoning = getattr(parent_agent, "reasoning_config", None)
     try:
-        delegation_effort = delegation_cfg.get("reasoning_effort")
-        if delegation_effort or delegation_effort is False:
-            from hermes_constants import parse_reasoning_effort
-            parsed = parse_reasoning_effort(delegation_effort)
-            if parsed is None:
-                logger.warning("Unknown delegation.reasoning_effort '%s', inheriting parent level", delegation_effort)
-            else:
-                child_reasoning = parsed
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            _full_cfg = load_config_readonly()
+        except Exception:
+            _full_cfg = {}
+        child_reasoning = _resolve_child_reasoning(
+            delegation_cfg, _full_cfg, effective_model, parent_reasoning
+        )
     except Exception as exc:
-        logger.debug("Could not load delegation reasoning_effort: %s", exc)
+        logger.debug("Could not load delegation reasoning config: %s", exc)
+        child_reasoning = parent_reasoning
 
     kwargs: Dict[str, Any] = {
         "base_url": effective_base_url, "api_key": override_api_key or parent_api_key, "model": effective_model,
