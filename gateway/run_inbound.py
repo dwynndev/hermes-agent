@@ -18,7 +18,8 @@ import re
 import time
 from contextlib import suppress
 from gateway.config import Platform
-from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
+from gateway.platforms.base import EphemeralReply
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run_common import _UNSET
 from gateway.session import (
     SessionSource, is_shared_multi_user_session, neutralize_untrusted_inline_text
@@ -154,11 +155,16 @@ class GatewayInboundMixin:
         # Ignored-channel guard runs FIRST — before startup-restore queueing, plugin hooks, auth,
         # and session setup — so an ignored channel can never reach pairing/auth/session state.
         _chat_id = getattr(source, "chat_id", None)
+        if not is_internal and getattr(source, "platform", None) == Platform.SLACK:
+            # The routed adapter's extra carries a secondary profile's own list; ``_config`` is the default's.
+            _slack_adapter = None
+            with suppress(Exception):
+                _slack_adapter = self._adapter_for_source(source)
         if (
             # See #51899.
             not is_internal
             and getattr(source, "platform", None) == Platform.SLACK
-            and _is_slack_ignored_channel(_config, _chat_id)
+            and _is_slack_ignored_channel(_config, _chat_id, _slack_adapter)
         ):
             logger.info("Dropping Slack message from configured ignored channel %s", _chat_id)
             return None
@@ -189,12 +195,16 @@ class GatewayInboundMixin:
                 logger.debug("Ignoring message with no user_id from %s", source.platform.value)
                 return None
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
-            # In DMs: offer pairing code. In groups: silently ignore.
+            # DMs get a pairing code, groups are ignored. A bot cannot pair, and answering one mid-cooldown is outbound traffic.
             if (
                 source.chat_type == "dm"
+                and not getattr(source, "is_bot", False)
                 and self._get_unauthorized_dm_behavior(source.platform, profile=source.profile) == "pair"
             ):
                 await self._hm_offer_pairing_code(source)
+            return None
+        # The busy path charged this event on arrival; a drained follow-up must not pay twice.
+        if not getattr(event, "_bot_loop_admitted", False) and not self._admit_bot_message_for_source(source):
             return None
         return event, source, False
 
@@ -557,7 +567,7 @@ class GatewayInboundMixin:
         steered = False
         if self._hm_text_only(event) and steer_text and hasattr(running_agent, "steer"):
             try:
-                steered = bool(running_agent.steer(steer_text))
+                steered = bool(running_agent.steer(self._steer_text_with_origin(steer_text, event)))
             except Exception as exc:
                 logger.warning("PRIORITY steer failed for session %s: %s", _quick_key, exc)
         if steered:
@@ -576,7 +586,9 @@ class GatewayInboundMixin:
         _can_redirect = getattr(running_agent, "_supports_active_turn_redirect", False) is True
         if self._hm_text_only(event) and _can_redirect and hasattr(running_agent, "redirect"):
             try:
-                if running_agent.redirect((event.text or "").strip()):
+                if running_agent.redirect(
+                    self._steer_text_with_origin((event.text or "").strip(), event)
+                ):
                     logger.debug("PRIORITY redirect for session %s", _quick_key)
                     return
             except Exception as exc:
@@ -1181,6 +1193,14 @@ class GatewayInboundMixin:
         if _admitted is None:
             return None
         event, source, is_internal = _admitted
+        # TERMINAL-DECLINE LATCH TEARDOWN. Deliberately placed AFTER admission,
+        # not on the adapter's raw inbound: profile routing, the ignored-channel
+        # guard, plugin hooks and user authorization all reject events above,
+        # and a rejected event must not be able to clear a refusal belonging to
+        # an active turn. This is also the single entry point every lane shares
+        # — Discord interaction passthrough builds its own MessageEvent and
+        # calls handle_message directly, so a teardown on the relay's inbound
+        # handler left those turns muted.
 
         _paused_notice = self._hm_estop_gate(event, source, is_internal)
         if _paused_notice is not None:
@@ -1497,9 +1517,11 @@ class GatewayInboundMixin:
         if getattr(event, "reply_to_text", None) and event.reply_to_message_id:
             # Always inject the reply-to pointer even when the quoted text is already in history:
             # it's disambiguation (*which* prior message), not deduplication.
-            reply_snippet = event.reply_to_text[:500]
+            # Adapters resolve the original message (or the user's native partial quote).
+            # A preview here silently loses later list items and code; keep that context intact.
+            reply_text = event.reply_to_text
             _who = " your previous message" if getattr(event, "reply_to_is_own_message", False) else ""
-            message_text = f'[Replying to{_who}: "{reply_snippet}"]\n\n{message_text}'
+            message_text = f'[Replying to{_who}: "{reply_text}"]\n\n{message_text}'
         return message_text
 
     async def _inbound_model_context_length(self, source: SessionSource, session_key: str) -> int:
@@ -1616,10 +1638,13 @@ class GatewayInboundMixin:
             message_text = await self._enrich_inbound_voice(event, source, message_text, audio_paths)
         message_text = self._prepend_inbound_media_file_notes(message_text, audio_file_paths, video_paths)
         message_text = self._prepend_inbound_document_notes(event, message_text)
-        message_text = self._prepend_inbound_reply_context(event, source, message_text)
         if "@" in message_text:
-            return await self._expand_inbound_context_references(source, session_key, message_text)
-        return message_text
+            message_text = await self._expand_inbound_context_references(source, session_key, message_text)
+            if message_text is None:
+                return None
+        # After expansion: the quoted reply is someone else's text and stays literal — an
+        # ``@file:`` inside it must never read a local file on the replier's behalf.
+        return self._prepend_inbound_reply_context(event, source, message_text)
 
     async def _prepare_profile_scoped_inbound_message_text(
         self, *, event: MessageEvent, source: SessionSource, history: List[Dict[str, Any]],
@@ -1769,7 +1794,7 @@ class GatewayInboundMixin:
 
         source = dataclasses.replace(entry.origin)
         try:
-            authorized = self._is_user_authorized(source, allow_adapter_delegation=False)
+            authorized = self._is_user_authorized_for_source(source, allow_adapter_delegation=False)
         except Exception:
             logger.warning(
                 "Plugin message injection authorization check failed: plugin=%s session=%s",
