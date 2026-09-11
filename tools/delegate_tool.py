@@ -615,9 +615,7 @@ _DESCRIPTION_HEAD = (
 )
 _DESCRIPTION_TAIL = (
     "- Children inherit the parent model unless pinned via delegation.provider / delegation.model in config.yaml. "
-    "An optional top-level 'model' parameter (single-goal form) or per-task 'model' field (batch form) overrides "
-    "the child model for those children only — restricted to the configured worker-model policy allowlist; "
-    "invalid values reject the whole call before any child is spawned."
+    "A per-call/per-task `model` override pins those children — allowlist-validated; invalid values reject the call."
 )
 
 def _build_tasks_param_description() -> str:
