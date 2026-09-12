@@ -1223,9 +1223,10 @@ class TestPermissionErrorOnLockFile:
     """Stale root-owned lock files from launchd Background sessions must not
     crash the gateway on restart (issue #42685)."""
 
-    def test_permission_error_on_lock_file_returns_false_and_removes(self, tmp_path, monkeypatch):
-        """When the lock file is not writable (root-owned), the function should
-        remove the stale file and report the lock as inactive."""
+    def test_permission_error_on_lock_file_returns_false_and_preserves(self, tmp_path, monkeypatch):
+        """When the lock file is not writable (root-owned), the probe reports the lock as
+        inactive WITHOUT removing it — liveness probes must not mutate; recovery belongs to
+        ``acquire_gateway_runtime_lock``'s unlink-and-recreate branch (W54-F023)."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         lock_path = tmp_path / "gateway.lock"
         lock_path.write_text("stale", encoding="utf-8")
@@ -1241,11 +1242,10 @@ class TestPermissionErrorOnLockFile:
 
         result = status.is_gateway_runtime_lock_active(lock_path)
         assert result is False
-        assert not lock_path.exists(), "stale root-owned lock file should be removed"
+        assert lock_path.exists(), "liveness probes must not unlink the lock file"
 
-    def test_permission_error_unlink_failure_still_returns_false(self, tmp_path, monkeypatch):
-        """Even if unlinking the stale lock file fails (e.g. directory not writable),
-        the function should still return False to allow startup."""
+    def test_permission_error_probe_still_returns_false(self, tmp_path, monkeypatch):
+        """An unreadable lock file must still report inactive so startup proceeds."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         lock_path = tmp_path / "gateway.lock"
         lock_path.write_text("stale", encoding="utf-8")

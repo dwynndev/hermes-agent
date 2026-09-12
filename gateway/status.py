@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,6 +41,10 @@ _gateway_lock_handle = None
 _WINDOWS_LOCK_OFFSET = 1024 * 1024
 _GATEWAY_RUNNING_PID_CACHE_TTL_SECONDS = 1.0
 _gateway_running_pid_cache_lock = threading.Lock()
+# Serializes write_runtime_status's read-merge-rename sequence: the only writers are this
+# process's adapter/recovery threads (exactly one gateway process writes a home's file), so an
+# in-process mutex is the complete fix for their lost updates.
+_runtime_status_rmw_lock = threading.Lock()
 # key: (pid_path, cleanup_stale, include_runtime_status) -> (cached_at, file signature, pid)
 _gateway_running_pid_cache: dict[tuple[str, bool, bool], tuple[float, tuple, Optional[int]]] = {}
 
@@ -63,18 +68,25 @@ def record_start_and_check_storm(
         path = get_hermes_home() / "gateway-starts.log"
         path.parent.mkdir(parents=True, exist_ok=True)
         now = datetime.now(timezone.utc).timestamp()
+        # Append-first: O_APPEND makes each single write syscall atomic, so concurrent starters
+        # can never drop each other's entries (read-modify-rewrite loses the interleaved start
+        # precisely during a double-start storm).
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(repr(now) + "\n")
         existing: list[float] = []
-        if path.exists():
-            for line in path.read_text(encoding="utf-8").splitlines():
-                with contextlib.suppress(ValueError):
-                    existing.append(float(line))
-        existing.append(now)
+        for line in path.read_text(encoding="utf-8").splitlines():
+            with contextlib.suppress(ValueError):
+                existing.append(float(line))
         recent = [ts for ts in existing if now - ts <= window_s]
-        # Ring-buffer the persisted file so it stays bounded.
-        to_write = existing[-max(max_starts * 4, 40):]
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text("\n".join(repr(ts) for ts in to_write) + "\n", encoding="utf-8")
-        os.replace(tmp, path)
+        # Ring-buffer the persisted file so it stays bounded; trim only when the read-back shows
+        # it over the bound. A concurrent trim at worst rewrites the same bounded content, and a
+        # lost trim is harmless (the next start trims). The tmp name is process-private so two
+        # concurrent trimmers never interleave writes into the same file.
+        if len(existing) > max(max_starts * 4, 40):
+            to_write = existing[-max(max_starts * 4, 40):]
+            tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+            tmp.write_text("\n".join(repr(ts) for ts in to_write) + "\n", encoding="utf-8")
+            os.replace(tmp, path)
         if len(recent) <= max_starts:
             return None
         backoff = min(backoff_cap_s, 5.0 * (2 ** min(len(recent) - max_starts, 6)))
@@ -221,17 +233,17 @@ def terminate_pid(
     process, the kill is refused on every platform — a mismatched fingerprint always means the PID was
     recycled. See #89614.
     """
-    if force and (_IS_WINDOWS or expected_start_time is not None):
+    if expected_start_time is not None or (force and _IS_WINDOWS):
         if expected_start_time is None:
             raise OSError(f"refusing to force-kill PID {pid} without a process start-time guard")
         current_start_time = _get_process_start_time(pid)
         if current_start_time is None:
-            raise OSError(f"refusing to force-kill PID {pid}; process start time is unavailable")
+            raise OSError(f"refusing to kill PID {pid}; process start time is unavailable")
         try:
             if not _start_times_agree(current_start_time, expected_start_time):
-                raise OSError(f"refusing to force-kill PID {pid}; process identity changed")
+                raise OSError(f"refusing to kill PID {pid}; process identity changed")
         except (TypeError, ValueError) as exc:
-            raise OSError(f"refusing to force-kill PID {pid}; malformed start time") from exc
+            raise OSError(f"refusing to kill PID {pid}; malformed start time") from exc
     if not (force and _IS_WINDOWS):
         os.kill(pid, signal.SIGTERM if not force else getattr(signal, "SIGKILL", signal.SIGTERM))
         return
@@ -672,6 +684,7 @@ def acquire_gateway_runtime_lock() -> bool:
         return True
     path = _get_gateway_lock_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    recreated = False
     try:
         handle = open(path, "a+", encoding="utf-8")
     except PermissionError:
@@ -682,9 +695,22 @@ def acquire_gateway_runtime_lock() -> bool:
             handle = open(path, "a+", encoding="utf-8")
         except OSError:
             return False
+        recreated = True
     if not _try_acquire_file_lock(handle):
         handle.close()
         return False
+    if recreated and not _IS_WINDOWS:
+        # flock arbitrates per inode: a second process taking the same recovery branch locks a
+        # DIFFERENT inode after its own recreate. Fail closed unless the path still names OUR
+        # handle's inode (POSIX-only inode identity check).
+        try:
+            handle_still_names_path = os.fstat(handle.fileno()).st_ino == os.stat(path).st_ino
+        except OSError:
+            handle_still_names_path = False
+        if not handle_still_names_path:
+            _release_file_lock(handle)
+            handle.close()
+            return False
     handle.seek(0)
     handle.truncate()
     json.dump(_build_pid_record(), handle)
@@ -736,8 +762,9 @@ def is_gateway_runtime_lock_active(lock_path: Optional[Path] = None) -> bool:
     try:
         handle = open(resolved_lock_path, "a+", encoding="utf-8")
     except PermissionError:
-        # Stale root-owned lock (see acquire_gateway_runtime_lock): report inactive.
-        _unlink_quietly(resolved_lock_path)
+        # Stale root-owned lock (see acquire_gateway_runtime_lock): a probe must not mutate —
+        # the acquire path owns the unlink-and-recreate recovery. Report inactive only.
+        logger.debug("gateway runtime lock %s is unreadable; reporting inactive", resolved_lock_path)
         return False
     return _probe_lock_file(handle)
 
@@ -807,50 +834,53 @@ def write_runtime_status(
     ingress_url: Any = _UNSET, clear_profile_platforms: bool = False,
 ) -> None:
     """Persist gateway runtime health information for diagnostics/status."""
-    path = _get_runtime_status_path()
-    payload = _read_json_file(path) or _build_runtime_status_record()
-    previous_payload = copy.deepcopy(payload)
-    current_record = _build_pid_record()
-    payload.setdefault("platforms", {})
-    if clear_profile_platforms:
-        # Secondary-profile entries are keyed ``<profile>:<platform>``. A fresh process must not
-        # inherit them or /api/status stays degraded until every old adapter re-emits.
-        platforms = payload["platforms"] if isinstance(payload["platforms"], dict) else {}
-        payload["platforms"] = {
-            k: v for k, v in platforms.items() if not isinstance(k, str) or ":" not in k
-        }
-    # Re-stamp identity + code fields on every write: the file can outlive its creator and the
-    # top-level record must describe the CURRENT writer.
-    payload.update({key: current_record[key] for key in ("kind", "pid", "argv", "start_time")})
-    payload["updated_at"] = _utc_now_iso()
-    payload.update(_get_code_identity_fields())
-    _apply_set_fields(payload, (
-        ("gateway_state", gateway_state, None), ("exit_reason", exit_reason, None),
-        ("restart_requested", restart_requested, bool),
-        ("active_agents", active_agents, parse_active_agents),
-        # Multiplexed profiles; absent/empty for a single-profile gateway.
-        ("served_profiles", served_profiles, lambda v: list(v or [])),
-        ("session_store", session_store, _coerce_session_store),
-    ))
-    if platform is not _UNSET:
-        platform_payload = payload["platforms"].get(platform, {})
-        _apply_set_fields(platform_payload, (
-            ("state", platform_state, None), ("error_code", error_code, None),
-            ("error_message", error_message, None),
-            # Reconnect-loop escalation past the attention threshold: a signal for owners/fleet
-            # monitoring, not a circuit breaker (retry never stops). Cleared on reconnect.
-            ("needs_attention", needs_attention, bool),
-            # ISO start of the current retry episode; None clears it.
-            ("retrying_since", retrying_since, None),
-            # Shared-listener secondaries: the /p/<profile>/ callback URL the vendor console must target.
-            ("ingress_url", ingress_url, None),
+    # Serialized read-merge-write: adapter reconnect threads and the session-DB recovery path
+    # can both land here concurrently, and an unlocked merge drops the interleaved update.
+    with _runtime_status_rmw_lock:
+        path = _get_runtime_status_path()
+        payload = _read_json_file(path) or _build_runtime_status_record()
+        previous_payload = copy.deepcopy(payload)
+        current_record = _build_pid_record()
+        payload.setdefault("platforms", {})
+        if clear_profile_platforms:
+            # Secondary-profile entries are keyed ``<profile>:<platform>``. A fresh process must not
+            # inherit them or /api/status stays degraded until every old adapter re-emits.
+            platforms = payload["platforms"] if isinstance(payload["platforms"], dict) else {}
+            payload["platforms"] = {
+                k: v for k, v in platforms.items() if not isinstance(k, str) or ":" not in k
+            }
+        # Re-stamp identity + code fields on every write: the file can outlive its creator and the
+        # top-level record must describe the CURRENT writer.
+        payload.update({key: current_record[key] for key in ("kind", "pid", "argv", "start_time")})
+        payload["updated_at"] = _utc_now_iso()
+        payload.update(_get_code_identity_fields())
+        _apply_set_fields(payload, (
+            ("gateway_state", gateway_state, None), ("exit_reason", exit_reason, None),
+            ("restart_requested", restart_requested, bool),
+            ("active_agents", active_agents, parse_active_agents),
+            # Multiplexed profiles; absent/empty for a single-profile gateway.
+            ("served_profiles", served_profiles, lambda v: list(v or [])),
+            ("session_store", session_store, _coerce_session_store),
         ))
-        # Per-entry writer provenance: top-level pid/start_time only identify the most recent
-        # writer; /api/status tells "live" from "preserved" by exact (pid, start_time) equality.
-        platform_payload.update(updated_at=_utc_now_iso(), writer_pid=current_record["pid"],
-                                writer_start_time=current_record["start_time"])
-        payload["platforms"][platform] = platform_payload
-    _write_json_file(path, payload)
+        if platform is not _UNSET:
+            platform_payload = payload["platforms"].get(platform, {})
+            _apply_set_fields(platform_payload, (
+                ("state", platform_state, None), ("error_code", error_code, None),
+                ("error_message", error_message, None),
+                # Reconnect-loop escalation past the attention threshold: a signal for owners/fleet
+                # monitoring, not a circuit breaker (retry never stops). Cleared on reconnect.
+                ("needs_attention", needs_attention, bool),
+                # ISO start of the current retry episode; None clears it.
+                ("retrying_since", retrying_since, None),
+                # Shared-listener secondaries: the /p/<profile>/ callback URL the vendor console must target.
+                ("ingress_url", ingress_url, None),
+            ))
+            # Per-entry writer provenance: top-level pid/start_time only identify the most recent
+            # writer; /api/status tells "live" from "preserved" by exact (pid, start_time) equality.
+            platform_payload.update(updated_at=_utc_now_iso(), writer_pid=current_record["pid"],
+                                    writer_start_time=current_record["start_time"])
+            payload["platforms"][platform] = platform_payload
+        _write_json_file(path, payload)
     with contextlib.suppress(Exception):
         from agent.monitoring.gateway_health import emit_runtime_status_transition
         emit_runtime_status_transition(previous_payload, payload)
@@ -1114,7 +1144,13 @@ def acquire_scoped_lock(
     existing = _read_json_file(lock_path)
     if existing is None and lock_path.exists():
         # Empty/invalid JSON: previous process died between O_EXCL create and json.dump().
-        _unlink_quietly(lock_path)
+        # Rename to a tombstone instead of unlink(): with unlink()+O_EXCL two racing starters
+        # could both win. os.replace() lets exactly one claim it; a failed replace means another
+        # racer claimed it and O_EXCL below decides.
+        with contextlib.suppress(OSError):
+            tombstone = lock_path.with_name(lock_path.name + ".stale")
+            os.replace(lock_path, tombstone)
+            _unlink_quietly(tombstone)
     if existing:
         existing_pid = _pid_from_record(existing)
         # Our own PID: always self-reacquire. start_time guards reuse of OTHER PIDs; requiring
