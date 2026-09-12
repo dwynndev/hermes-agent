@@ -924,6 +924,11 @@ class SessionSchemaMixin:
         # UNIQUE index makes a retried append after an ambiguously-settled commit (row landed,
         # IOERR raised) a no-op instead of a duplicate transcript row. NULLs (all rows written
         # before the stamp existed, and every non-gateway writer) stay exempt.
+        # RUNTIME FLOOR: the paired INSERT targets this partial index with
+        # ``ON CONFLICT(client_msg_id) WHERE client_msg_id IS NOT NULL DO NOTHING`` — a
+        # partial-index conflict target needs SQLite >= 3.35 (2021-03-12). The runtime ships
+        # 3.45.x, so there is no version gate here; sub-3.35 SQLite would reject the INSERT
+        # syntax outright. The partial UNIQUE index itself needs 3.8.8+.
         try:
             cursor.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS messages_client_msg_id "

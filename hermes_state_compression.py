@@ -280,7 +280,8 @@ class SessionCompressionMixin:
                 conn, parent, parent_session_id=parent_session_id, child_session_id=child_session_id,
                 source=source, model=model, model_config=model_config, system_prompt=system_prompt,
                 cwd=cwd, profile_name=profile_name)
-            total_messages, total_tool_calls = self._insert_message_rows(conn, child_session_id, messages)
+            total_messages, total_tool_calls = self._insert_message_rows(
+                conn, child_session_id, messages, keep_client_msg_id=False)
             if watermark is not None:
                 # Clone the parent's concurrent tail into the child after the handoff;
                 # originals stay in the closed parent for lineage recovery.

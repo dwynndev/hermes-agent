@@ -492,21 +492,40 @@ class SessionMessagesMixin:
         row = self._read_one("SELECT role FROM messages WHERE id = ? AND session_id = ? AND active = 1", (int(row_id), session_id))
         return row[0] if row else None
 
-    def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
+    def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]], *,
+                             keep_client_msg_id: bool = True) -> tuple[int, int]:
         """Insert *messages* as fresh active rows in the caller's txn -> ``(inserted, tool_call_count)``.
-        Never touches sessions.* counters (callers reconcile differently); reasoning kept for assistant rows."""
+        Never touches sessions.* counters (callers reconcile differently); reasoning kept for assistant rows.
+
+        ``client_msg_id`` is ENQUEUE-TIME idempotency metadata, not message-payload identity (B08 R2):
+        row copies and re-inserts of ``get_messages`` output (replace/rewind/compact/rotation paths)
+        must not carry it, or the GLOBAL ``messages_client_msg_id`` UNIQUE partial index either rejects
+        the clone INSERT outright (raw clone SQL) or silently swallows the re-insert against the
+        soft-archived original (ON CONFLICT DO NOTHING). Pass ``keep_client_msg_id=False`` on every
+        re-insert path; only the enqueue path (:meth:`append_messages_batch`) keeps the key, so a
+        dup-swallow there is intentional retry idempotency and the rowcount-gated counter below
+        reports the rows that actually landed."""
         now_ts = time.time()
         inserted = tool_calls_total = 0
         for msg in messages:
             role = msg.get("role", "unknown")
             tool_calls = _parse_tool_calls(msg.get("tool_calls"))
             message_timestamp = _coerce_timestamp(msg.get("timestamp"), now_ts)
+            row = msg
+            if not keep_client_msg_id and msg.get("client_msg_id") is not None:
+                # Strip on a copy — never mutate dicts callers still hold (get_messages output).
+                row = dict(msg)
+                row["client_msg_id"] = None
             cur = conn.execute(_INSERT_MESSAGE_SQL, self._message_row_params(
-                session_id, role, msg, tool_calls, message_timestamp, keep_reasoning=role == "assistant"))
-            if cur.lastrowid is not None:
-                msg["_row_id"] = cur.lastrowid
-            inserted += 1
-            tool_calls_total += _tool_calls_count(tool_calls)
+                session_id, role, row, tool_calls, message_timestamp, keep_reasoning=role == "assistant"))
+            # rowcount is the land signal: an ON CONFLICT DO NOTHING skip leaves the cursor's
+            # lastrowid at the previous successful insert, so lastrowid-based counting would
+            # over-report swallowed duplicates (B08 R2 batch-counter bug).
+            if cur.rowcount > 0:
+                inserted += 1
+                tool_calls_total += _tool_calls_count(tool_calls)
+                if cur.lastrowid is not None:
+                    msg["_row_id"] = cur.lastrowid
             now_ts = max(now_ts, message_timestamp) + 1e-6
         return inserted, tool_calls_total
 
@@ -540,7 +559,8 @@ class SessionMessagesMixin:
             else:
                 conn.execute(f"DELETE FROM messages WHERE session_id = ?{' AND active = 1' if active_only else ''}", (session_id,))
             conn.execute(_RESET_COUNTERS_SQL, (session_id,))
-            total_messages, total_tool_calls = self._insert_message_rows(conn, session_id, messages)
+            total_messages, total_tool_calls = self._insert_message_rows(
+                conn, session_id, messages, keep_client_msg_id=False)
             conn.execute(f"{_SET_COUNTERS_SQL} WHERE id = ?", (total_messages, total_tool_calls, session_id))
         self._execute_write(_do)
 
@@ -574,7 +594,11 @@ class SessionMessagesMixin:
         # A clone is a newly positioned display generation. Copy its indexed
         # identity, but let the insert trigger assign order from rows that are
         # still display-visible (the source may just have become rewind-only).
-        skip = ("id", "active", "compacted", "display_order") + (("session_id",) if retarget else ())
+        # client_msg_id is enqueue-scoped idempotency metadata, NOT payload identity (B08 R2): a clone
+        # must not copy it — the soft-archived original still holds the key and this raw INSERT (no
+        # ON CONFLICT clause) would raise IntegrityError against the GLOBAL UNIQUE partial index; a
+        # cross-session clone must not inherit dedupe identity it never enqueued. Clones insert NULL.
+        skip = ("id", "active", "compacted", "display_order", "client_msg_id") + (("session_id",) if retarget else ())
         col_list = ", ".join(c for c in self._message_column_names(conn) if c not in skip)
         conn.execute(
             f"INSERT INTO messages ({col_list}, {'session_id, ' if retarget else ''}active, compacted) "
@@ -634,7 +658,8 @@ class SessionMessagesMixin:
                 conn.execute(f"{_ARCHIVE_ACTIVE_SQL} AND id NOT IN ({placeholders})", [session_id, *rewind_ids])
             else:
                 conn.execute(_ARCHIVE_ACTIVE_SQL, (session_id,))
-            inserted, tool_calls_total = self._insert_message_rows(conn, session_id, compacted_messages)
+            inserted, tool_calls_total = self._insert_message_rows(
+                conn, session_id, compacted_messages, keep_client_msg_id=False)
             if tail_ids:
                 self._clone_message_rows(conn, tail_ids)
                 inserted += len(tail_ids)
@@ -1208,7 +1233,7 @@ class SessionMessagesMixin:
             if ids:
                 conn.execute(f"UPDATE messages SET active = 0 WHERE id IN ({_placeholders(ids)})", ids)
             if replacement is not None:
-                self._insert_message_rows(conn, session_id, [replacement])
+                self._insert_message_rows(conn, session_id, [replacement], keep_client_msg_id=False)
                 replacement_message_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
             conn.execute(
                 "UPDATE sessions SET rewind_count = COALESCE(rewind_count, 0) + 1 WHERE id = ?", (session_id,))
