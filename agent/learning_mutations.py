@@ -7,19 +7,65 @@ Shared by CLI ``hermes journey``, the TUI ``/journey`` overlay and the desktop.
 Deleting a skill *archives* it (``hermes curator restore`` recovers it);
 deleting a memory rewrites its file.
 
-Memory mutations run their locate→mutate→write span under the same
-``MemoryStore._file_lock`` the memory tool uses, and re-resolve the target
-entry by CONTENT inside the lock (W54-F028: a concurrent ``MemoryStore.add``
-can never be clobbered by a journey write; W54-F034: the mutated entry is the
-one the graph rendered, even if its index moved).
+Memory mutations run their mutate→write span under the same
+``MemoryStore._file_lock`` the memory tool uses, so a concurrent
+``MemoryStore`` write can never be clobbered by a journey write (W54-F028).
+
+Node identity is a CONTENT FINGERPRINT captured at PREFILL time (W54-F034)
+and matched (never re-derived positionally) inside the lock at commit:
+``node_detail`` — the edit prefill — records the exact chunk text it rendered,
+and the commit re-matches that chunk by full-text equality under the lock. A
+concurrent write shifting indices during the prefill→commit window can
+neither move the mutation onto a different entry nor delete/rewrite the new
+occupant: zero matches raise an explicit stale error ("memory node changed
+since prefill — refresh the graph"), surfaced as ``ok=False``. Duplicate
+identical chunks (two nodes whose content is byte-identical) resolve
+deterministically to the FIRST match in file order, identical to
+``tools.memory_tool_store._find_unique_match`` — defined, documented
+behavior: the prefill cannot distinguish identical bodies, so position is
+only a tie-breaker supplied by the file itself.
+
+Ids committed WITHOUT a same-process prefill (direct API calls, e.g. the
+web PUT or a scripted ``edit_node``/``delete_node``) keep the positional
+fallback: the id still resolves positionally and the entry is re-read and
+re-matched by content under the lock (same semantics as the round-1 fix), so
+positional edits/deletes keep working and F028 still holds for them.
 """
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Any, Callable
 
 _MEMORY_FILES = {"memory": "MEMORY.md", "profile": "USER.md"}
+
+
+# Prefill registry: node_id → (store path, chunk text rendered at prefill).
+# Captured by ``node_detail`` (the edit prefill), consumed once by the commit
+# under the same process. Capped FIFO so a long-lived process cannot grow it
+# without bound.
+_PREFILLS: dict[str, tuple[Path, str]] = {}
+_PREFILLS_GUARD = threading.Lock()
+_PREFILLS_MAX = 256
+
+
+def _register_prefill(node_id: str, path: Path, chunk: str) -> None:
+    """Capture the content fingerprint (full chunk text) of the entry the
+    graph rendered for ``node_id`` at prefill time — W54-F034: the commit
+    re-matches THIS text under the lock, never a re-derived position."""
+    with _PREFILLS_GUARD:
+        if node_id not in _PREFILLS and len(_PREFILLS) >= _PREFILLS_MAX:
+            _PREFILLS.pop(next(iter(_PREFILLS)), None)
+        _PREFILLS[node_id] = (path, chunk)
+
+
+def _take_prefill(node_id: str) -> tuple[Path, str] | None:
+    """Pop the prefill-time fingerprint for ``node_id`` (one-shot: each
+    commit consumes its own prefill). ``None`` when the id was passed to the
+    mutation API without an in-process ``node_detail`` prefill."""
+    with _PREFILLS_GUARD:
+        return _PREFILLS.pop(node_id, None)
 
 
 def parse_node_kind(node_id: str) -> str:
@@ -38,19 +84,19 @@ def _parse_memory_id(node_id: str) -> tuple[str, int]:
 
 
 def _resolve_memory_identity(node_id: str) -> tuple[Path, str, str]:
-    """Resolve a memory node id to ``(path, source, content fingerprint)``.
+    """Resolve a memory node id to ``(path, source, chunk text)``.
 
-    The fingerprint is the FULL chunk text of the entry the journey graph
-    rendered for this node, captured read-only and unlocked. Under a
-    concurrent writer the positional index may be stale by the time the
-    mutation lands, so the mutation stage re-matches this content under the
+    The path comes from ``MemoryStore._path_for`` (structural identity with
+    the store's lock, not a duplicated derivation), the chunk is the entry
+    the journey graph rendered for this node, captured read-only and
+    unlocked. Under a concurrent writer the positional index may be stale by
+    the time a mutation lands, so mutations re-match this content under the
     store's file lock instead of trusting ``gidx`` (W54-F034)."""
-    from hermes_constants import get_hermes_home
     from agent.learning_graph import _memory_cards
     from tools.memory_tool import MemoryStore
 
     source, gidx = _parse_memory_id(node_id)
-    path = get_hermes_home() / "memories" / _MEMORY_FILES[source]
+    path = MemoryStore._path_for("user" if source == "profile" else "memory")
     if not path.exists():
         raise ValueError(f"{path.name} not found")
     cards = _memory_cards()
@@ -69,15 +115,35 @@ def _resolve_memory_identity(node_id: str) -> tuple[Path, str, str]:
 def _mutate_memory_locked(node_id: str, mutate: Callable[[list[str], int], None]) -> Path:
     """Locate→mutate→write under the store's file lock (W54-F028).
 
-    The file is re-read INSIDE the lock and the target entry re-resolved by
-    content fingerprint: a concurrent ``MemoryStore`` writer (e.g. ``add``)
-    that committed between our snapshot and our write can neither be
-    clobbered by a stale write nor shift our mutation onto a different
-    entry. Duplicate identical chunks resolve to the first, matching
-    ``tools.memory_tool_store._find_unique_match``. Returns the mutated
-    file's path."""
+    The target entry is resolved by the CONTENT FINGERPRINT captured at
+    PREFILL time (``node_detail``) and re-matched by full-text equality
+    INSIDE the lock — never derived positionally at commit (W54-F034). A
+    concurrent ``MemoryStore`` write that lands between prefill and commit
+    can neither be clobbered nor shift the mutation onto a different entry:
+
+    * prefilled ids: zero matches raise an explicit ``ValueError`` (``memory
+      node changed since prefill — refresh the graph``) — surfaced as
+      ``ok=False``; duplicate identical chunks resolve deterministically to
+      the FIRST match in file order, matching
+      ``tools.memory_tool_store._find_unique_match``;
+    * ids without a same-process prefill (direct API calls): positional
+      fallback with the same under-lock re-read + content re-match, so
+      positional edits/deletes keep working (F028 still holds).
+
+    Returns the mutated file's path."""
     from tools.memory_tool import MemoryStore
 
+    prefill = _take_prefill(node_id)
+    if prefill is not None:
+        path, chunk = prefill
+        with MemoryStore._file_lock(path):
+            chunks = MemoryStore._read_file(path)
+            matches = [i for i, c in enumerate(chunks) if c == chunk]
+            if not matches:
+                raise ValueError("memory node changed since prefill — refresh the graph")
+            mutate(chunks, matches[0])
+            _write_memory(path, chunks)
+        return path
     path, _, fingerprint = _resolve_memory_identity(node_id)
     with MemoryStore._file_lock(path):
         chunks = MemoryStore._read_file(path)
@@ -120,7 +186,11 @@ def node_detail(node_id: str) -> dict[str, Any]:
 
 
 def _memory_detail(node_id: str) -> dict[str, Any]:
-    _, _, body = _resolve_memory_identity(node_id)
+    path, _, body = _resolve_memory_identity(node_id)
+    # Prefill capture (W54-F034): bind this id to the chunk rendered HERE so
+    # the later commit re-matches THIS content under the lock instead of
+    # re-deriving it positionally once the file may have moved on.
+    _register_prefill(node_id, path, body)
     body = body.strip()
     return {"ok": True, "kind": "memory", "id": node_id, "label": body.splitlines()[0][:80], "content": body}
 

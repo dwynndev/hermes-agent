@@ -14,6 +14,14 @@ Two findings are pinned:
   to mutate must be re-resolved by CONTENT (fingerprint captured before the
   lock, re-matched under it). Assertions are made purely on entry content —
   never on indices — so a mutation that landed on the wrong entry fails.
+* **F034-r2 — prefill-window shift (mutant-killing).** The fingerprint a
+  committed mutation must re-match is the chunk captured at ``node_detail``
+  prefill time. The tests below shift indices BETWEEN prefill and commit — a
+  concurrent-session ``add`` that moves the memory/profile boundary, or a
+  ``remove`` of an entry before the victim — and assert by content that the
+  prefilled victim, and only the victim, is mutated. A commit-time POSITIONAL
+  re-derivation (the round-1 implementation; the lock-held positional
+  half-fix mutant) silently mutates the wrong entry and these assertions fail.
 
 Determinism without sleeps: the F028 tests are choreographed with events. An
 event fires the moment the mutation has READ its snapshot, and a second event
@@ -23,6 +31,12 @@ the snapshot read happens pre-lock and the write is re-resolved under the
 store's existing flock, so the same choreography serializes cleanly and no
 lost update is possible (deterministic GREEN, no deadlock — the second event
 is set after the add completes, never while holding the store lock).
+
+The F034-r2 prefill-window tests need no sleep either: the shift lands in the
+user-visible minutes-scale window BETWEEN two synchronous calls (the
+``node_detail`` prefill and the ``edit_node``/``delete_node`` commit), so the
+interleaving is ordered by construction — prefill, then the concurrent
+session's locked write, then the commit.
 """
 
 from __future__ import annotations
@@ -49,6 +63,20 @@ def store_files():
     us = home / "memories" / "USER.md"
     mm.write_text("alpha start\n§\nvictim original", encoding="utf-8")
     us.write_text("up one\n§\nup two", encoding="utf-8")
+    return mm, us
+
+
+@pytest.fixture
+def shift_files():
+    """MEMORY.md with one chunk; USER.md with three — victim at profile index 1
+    (global ``memory:profile:2``). A remove/edit of 'profile zero' before the
+    commit genuinely shifts the victim's positional index."""
+    home = get_hermes_home()
+    (home / "memories").mkdir(parents=True, exist_ok=True)
+    mm = home / "memories" / "MEMORY.md"
+    us = home / "memories" / "USER.md"
+    mm.write_text("mem one", encoding="utf-8")
+    us.write_text("profile zero\n§\nvictim p1\n§\nprofile two", encoding="utf-8")
     return mm, us
 
 
@@ -200,3 +228,78 @@ def test_f034_right_entry_mutated_across_shifted_indices(store_files):
             assert f"concurrent add {r}-{j}" in entries, \
                 f"round {r}: racing add lost (F028/F034)"
         assert f"neighbor {r}" in entries, f"round {r}: bystander mutated"
+
+
+# ── F034-r2: prefill-window shift (mutant-killing) ─────────────────────────
+#
+# The contraction these tests pin: node_detail() prefills the chunk for an id
+# at render time; between prefill and commit a concurrent session legally
+# writes, moving the boundary the positional id indexes against; the commit
+# must re-match the PREFILLED chunk (or fail stale) — positional
+# re-derivation at commit time silently mutates the wrong entry.
+
+def test_f034_prefill_add_shift_edit_must_hit_prefilled_victim(store_files):
+    """Canonical prefill-window shift (review H1): the user prefills node
+    ``memory:profile:3`` (USER.md chunk 'up two'); before the commit a
+    concurrent session appends to MEMORY.md. The append moves the
+    memory/profile boundary, so the positional id now RESOLVES to 'up one'.
+    The commit must edit the chunk the prefill rendered ('up two'). A
+    commit-time positional re-derivation (round-1 implementation; the
+    lock-held positional half-fix mutant) rewrites 'up one' instead and the
+    content assertions fail.
+    """
+    _, us = store_files
+    store = _fresh_store()
+    victim_id = "memory:profile:3"
+    detail = lm.node_detail(victim_id)  # prefill: the graph render the user sees
+    assert detail["ok"], detail
+    assert detail["content"] == "up two", "fixture drift: prefill rendered wrong chunk"
+    # Concurrent session writes its own entry during the minutes-scale window.
+    assert store.add("memory", "shifts profile boundary")["success"]
+    res = lm.edit_node(victim_id, "up two EDITED")
+    entries = MemoryStore._read_file(us)
+    assert res.get("ok"), res
+    assert "up two EDITED" in entries, "edit missed the prefilled victim"
+    assert "up two" not in entries, "prefilled victim left untouched"
+    assert "up one" in entries, "edit silently rewrote the shifted-index occupant (wrong entry)"
+
+
+def test_f034_prefill_remove_shift_edit_must_hit_prefilled_victim(shift_files):
+    """Same window, same-file shift: a concurrent session REMOVES the entry
+    before the victim inside USER.md, moving the victim from profile index 1
+    to 0. A positional re-derivation at commit points at the FOLLOWING chunk
+    ('profile two') and rewrites it; the prefilled victim must be edited
+    instead.
+    """
+    _, us = shift_files
+    store = _fresh_store()
+    victim_id = "memory:profile:2"
+    detail = lm.node_detail(victim_id)
+    assert detail["ok"], detail
+    assert detail["content"] == "victim p1", "fixture drift: prefill rendered wrong chunk"
+    assert store.remove("user", "profile zero")["success"]
+    res = lm.edit_node(victim_id, "victim p1 EDITED")
+    entries = MemoryStore._read_file(us)
+    assert res.get("ok"), res
+    assert "victim p1 EDITED" in entries, "edit missed the prefilled victim"
+    assert "victim p1" not in entries, "prefilled victim left untouched"
+    assert "profile two" in entries, "edit silently rewrote the shifted-index occupant (wrong entry)"
+
+
+def test_f034_prefill_remove_shift_delete_must_hit_prefilled_victim(shift_files):
+    """Delete in the same prefill-window shift: positional re-derivation at
+    commit would silently delete the WRONG entry while the prefilled victim
+    survives. The delete must remove the prefilled chunk — or fail stale.
+    """
+    _, us = shift_files
+    store = _fresh_store()
+    victim_id = "memory:profile:2"
+    detail = lm.node_detail(victim_id)
+    assert detail["ok"], detail
+    assert detail["content"] == "victim p1", "fixture drift: prefill rendered wrong chunk"
+    assert store.remove("user", "profile zero")["success"]
+    res = lm.delete_node(victim_id)
+    entries = MemoryStore._read_file(us)
+    assert res.get("ok"), res
+    assert "victim p1" not in entries, "prefilled victim not deleted (wrong-entry positional delete)"
+    assert "profile two" in entries, "delete silently removed the shifted-index occupant (wrong entry)"
