@@ -114,6 +114,27 @@ def _find_session_id(platform: str, chat_id: str, thread_id: Optional[str] = Non
     return max(candidates, key=lambda entry: entry.get("updated_at", "")).get("session_id")
 
 
+def _target_session_has_active_turn_lease(db, session_id: str) -> bool:
+    """True when the target session's conversation root holds a live (non-stale) turn lease.
+
+    One SELECT on session_turn_leases via the acquired SessionDB handle; the lease-domain key
+    resolution walks compression parents the same way the in-txn write guard does. A stale or
+    absent row is not an active lease, and any lookup doubt degrades to False (mirror proceeds
+    exactly as before this check existed).
+    """
+    try:
+        import time
+        from hermes_state_messages import _stale_holder
+        key = db._session_turn_lease_key(session_id)
+        with db._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT holder, expires_at FROM session_turn_leases WHERE conversation_id = ?",
+                (key,)).fetchone()
+        return row is not None and not _stale_holder(row, time.time())
+    except Exception:
+        return False
+
+
 def _append_to_sqlite(session_id: str, message: dict) -> None:
     """Append a message to the SQLite session database."""
     try:
@@ -121,7 +142,13 @@ def _append_to_sqlite(session_id: str, message: dict) -> None:
 
         db = acquire()
         try:
-            db.append_message(session_id=session_id, role=message.get("role", "assistant"), content=message.get("content"))
+            role = message.get("role", "assistant")
+            if role != "user" and _target_session_has_active_turn_lease(db, session_id):
+                # A live cross-process turn owns this session: force role="user" so the
+                # consecutive-user merge collapses the mirror instead of breaking strict role
+                # alternation mid-turn (extends mirror_to_session's role-shift mitigation).
+                role = "user"
+            db.append_message(session_id=session_id, role=role, content=message.get("content"))
         finally:
             release_or_close(db)
     except Exception as e:

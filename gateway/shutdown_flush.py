@@ -232,7 +232,9 @@ def recover_pending_to_db(session_db=None) -> int:
 
 
 def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any]) -> bool:
-    """Append one flush payload to ``session_db``; False (file kept) when structurally invalid."""
+    """Append one flush payload to ``session_db``; False (file kept) when structurally invalid
+    or when the target session's active cross-process turn lease rejects the write (W54-F010)."""
+    from hermes_state_errors import SessionTurnLeaseLostError
     # Cap-dropped transcript payloads carry the full message dict keyed by session_id — replay directly
     # (#78182). This handles spool files that were never drained before a restart.
     if payload.get("reason") == TRANSCRIPT_CAP_DROP_REASON:
@@ -243,9 +245,15 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any]) -> boo
             logger.warning("Cannot recover structurally invalid transcript spool "
                            "file %s; preserved for manual inspection", path)
             return False
-        session_db.append_message(session_id=spooled_sid, role=message.get("role", "unknown"),
-                                  content=message.get("content") or "",
-                                  timestamp=message.get("timestamp") or payload.get("ts"))
+        try:
+            session_db.append_message(session_id=spooled_sid, role=message.get("role", "unknown"),
+                                      content=message.get("content") or "",
+                                      timestamp=message.get("timestamp") or payload.get("ts"),
+                                      reject_active_turn_lease=True)
+        except SessionTurnLeaseLostError:
+            logger.warning("Active turn lease on session %s; keeping spool file %s for a later retry",
+                           spooled_sid, path)
+            return False
         return True
     session_key, data = payload.get("session_key", ""), payload.get("data", {})
     text = data.get("text", "")
@@ -261,8 +269,14 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any]) -> boo
                        "session_key-to-id resolution is not available at this recovery stage. "
                        "The message text is preserved in %s", session_key, path)
         return False
-    session_db.append_message(session_id=session_id, role="user", content=text,
-                              timestamp=payload.get("ts", int(time.time())))
+    try:
+        session_db.append_message(session_id=session_id, role="user", content=text,
+                                  timestamp=payload.get("ts", int(time.time())),
+                                  reject_active_turn_lease=True)
+    except SessionTurnLeaseLostError:
+        logger.warning("Active turn lease on session %s; keeping pending message file %s for a later retry",
+                       session_id, path)
+        return False
     return True
 
 

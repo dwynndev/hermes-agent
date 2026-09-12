@@ -26,6 +26,7 @@ from hermes_constants import (
     get_hermes_home, get_hermes_home_override, profile_name_for_home,
     reset_hermes_home_override, set_hermes_home_override)
 from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_state_errors import SessionTurnLeaseLostError
 from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import sanitize_replay_history
@@ -1669,7 +1670,12 @@ def _append_model_switch_marker(session: dict | None, *, model: str, provider: s
             _ensure_session_db_row(session)
         with (contextlib.nullcontext(db) if db is not None else _session_db(session)) as db:
             if db is not None:
-                db.append_message(session_id=session_key, role="user", content=marker, display_kind="model_switch")
+                db.append_message(session_id=session_key, role="user", content=marker,
+                                  display_kind="model_switch", reject_active_turn_lease=True)
+    except SessionTurnLeaseLostError:
+        # A live cross-process turn owns this session. The marker already sits in the in-memory
+        # history, so persistence retries naturally the next time a marker switch collapses it (#65891).
+        logger.warning("Active turn lease on session %s; model-switch marker stays in-memory", session_key)
     except Exception:
         logger.debug("failed to persist model switch marker", exc_info=True)
 

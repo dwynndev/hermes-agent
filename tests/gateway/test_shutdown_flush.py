@@ -94,6 +94,7 @@ def test_recover_inserts_via_append_message_and_deletes_file(tmp_path, monkeypat
         role="user",
         content="lost message",
         timestamp=ts,
+        reject_active_turn_lease=True,
     )
     assert not flush_file.exists()
 
