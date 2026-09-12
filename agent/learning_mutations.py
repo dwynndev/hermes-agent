@@ -6,6 +6,12 @@ for USER.md; ``index`` = position in the combined card list, MEMORY.md first).
 Shared by CLI ``hermes journey``, the TUI ``/journey`` overlay and the desktop.
 Deleting a skill *archives* it (``hermes curator restore`` recovers it);
 deleting a memory rewrites its file.
+
+Memory mutations run their locate→mutate→write span under the same
+``MemoryStore._file_lock`` the memory tool uses, and re-resolve the target
+entry by CONTENT inside the lock (W54-F028: a concurrent ``MemoryStore.add``
+can never be clobbered by a journey write; W54-F034: the mutated entry is the
+one the graph rendered, even if its index moved).
 """
 
 from __future__ import annotations
@@ -31,11 +37,14 @@ def _parse_memory_id(node_id: str) -> tuple[str, int]:
         raise ValueError(f"bad memory node id: {node_id!r}") from exc
 
 
-def _locate_memory(node_id: str) -> tuple[Path, list[str], int]:
-    """Resolve a memory node id to (file, all §-delimited entries, local index).
-    Entries come from ``MemoryStore._read_file`` — the memory tool's own parser —
-    so journey indices stay aligned with what the graph renders; a profile card's
-    local index is its global index minus the MEMORY.md card count."""
+def _resolve_memory_identity(node_id: str) -> tuple[Path, str, str]:
+    """Resolve a memory node id to ``(path, source, content fingerprint)``.
+
+    The fingerprint is the FULL chunk text of the entry the journey graph
+    rendered for this node, captured read-only and unlocked. Under a
+    concurrent writer the positional index may be stale by the time the
+    mutation lands, so the mutation stage re-matches this content under the
+    store's file lock instead of trusting ``gidx`` (W54-F034)."""
     from hermes_constants import get_hermes_home
     from agent.learning_graph import _memory_cards
     from tools.memory_tool import MemoryStore
@@ -44,16 +53,40 @@ def _locate_memory(node_id: str) -> tuple[Path, list[str], int]:
     path = get_hermes_home() / "memories" / _MEMORY_FILES[source]
     if not path.exists():
         raise ValueError(f"{path.name} not found")
-    chunks = MemoryStore._read_file(path)
     cards = _memory_cards()
     if not 0 <= gidx < len(cards):
         raise IndexError(f"memory index {gidx} out of range")
     if cards[gidx].get("source") != source:
         raise ValueError("memory node id is stale — refresh the graph")
-    local = gidx if source == "memory" else gidx - sum(1 for c in cards if c.get("source") == "memory")
+    chunks = MemoryStore._read_file(path)
+    mem_count = sum(1 for c in cards if c.get("source") == "memory")
+    local = gidx if source == "memory" else gidx - mem_count
     if not 0 <= local < len(chunks):
         raise ValueError("memory node id is stale — refresh the graph")
-    return path, chunks, local
+    return path, source, chunks[local]
+
+
+def _mutate_memory_locked(node_id: str, mutate: Callable[[list[str], int], None]) -> Path:
+    """Locate→mutate→write under the store's file lock (W54-F028).
+
+    The file is re-read INSIDE the lock and the target entry re-resolved by
+    content fingerprint: a concurrent ``MemoryStore`` writer (e.g. ``add``)
+    that committed between our snapshot and our write can neither be
+    clobbered by a stale write nor shift our mutation onto a different
+    entry. Duplicate identical chunks resolve to the first, matching
+    ``tools.memory_tool_store._find_unique_match``. Returns the mutated
+    file's path."""
+    from tools.memory_tool import MemoryStore
+
+    path, _, fingerprint = _resolve_memory_identity(node_id)
+    with MemoryStore._file_lock(path):
+        chunks = MemoryStore._read_file(path)
+        matches = [i for i, chunk in enumerate(chunks) if chunk == fingerprint]
+        if not matches:
+            raise ValueError("memory node id is stale — refresh the graph")
+        mutate(chunks, matches[0])
+        _write_memory(path, chunks)
+    return path
 
 
 def _write_memory(path: Path, chunks: list[str]) -> None:
@@ -87,8 +120,8 @@ def node_detail(node_id: str) -> dict[str, Any]:
 
 
 def _memory_detail(node_id: str) -> dict[str, Any]:
-    _, chunks, local = _locate_memory(node_id)
-    body = chunks[local].strip()
+    _, _, body = _resolve_memory_identity(node_id)
+    body = body.strip()
     return {"ok": True, "kind": "memory", "id": node_id, "label": body.splitlines()[0][:80], "content": body}
 
 
@@ -125,9 +158,7 @@ def _delete_skill(name: str) -> dict[str, Any]:
 
 
 def _delete_memory(node_id: str) -> dict[str, Any]:
-    path, chunks, local = _locate_memory(node_id)
-    del chunks[local]
-    _write_memory(path, chunks)
+    path = _mutate_memory_locked(node_id, lambda chunks, idx: chunks.__delitem__(idx))
     return {"ok": True, "message": f"deleted memory from {path.name}"}
 
 
@@ -151,7 +182,6 @@ def _edit_memory(node_id: str, content: str) -> dict[str, Any]:
     body = content.strip()
     if not body:
         return {"ok": False, "message": "empty memory — use delete to remove it"}
-    path, chunks, local = _locate_memory(node_id)
-    chunks[local] = body
-    _write_memory(path, chunks)
+    path = _mutate_memory_locked(
+        node_id, lambda chunks, idx: chunks.__setitem__(idx, body))
     return {"ok": True, "message": f"updated memory in {path.name}"}
