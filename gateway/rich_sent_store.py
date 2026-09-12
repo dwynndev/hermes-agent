@@ -13,8 +13,11 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from typing import Optional
+
+_WRITE_LOCK = threading.Lock()  # serialize _update's load->merge->replace (W54-F036/F043)
 
 _MAX_ENTRIES = 1000
 _MAX_TEXT_CHARS = 2000
@@ -39,18 +42,19 @@ def _update(chat_id, message_id, fields: dict) -> None:
     path = _store_path()
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        data = _load(path)
-        key = f"{chat_id}:{message_id}"
-        entry = data.get(key)
-        entry = entry if isinstance(entry, dict) else {}
-        data[key] = {**entry, **fields, "ts": int(time.time())}
-        if len(data) > _MAX_ENTRIES:  # trim oldest by timestamp
-            for k, _ in sorted(data.items(), key=lambda kv: kv[1].get("ts", 0))[: len(data) - _MAX_ENTRIES]:
-                data.pop(k, None)
-        tmp = f"{path}.tmp.{os.getpid()}"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, ensure_ascii=False)
-        os.replace(tmp, path)  # atomic; tolerates concurrent writers racing
+        with _WRITE_LOCK:
+            data = _load(path)
+            key = f"{chat_id}:{message_id}"
+            entry = data.get(key)
+            entry = entry if isinstance(entry, dict) else {}
+            data[key] = {**entry, **fields, "ts": int(time.time())}
+            if len(data) > _MAX_ENTRIES:  # trim oldest by timestamp
+                for k, _ in sorted(data.items(), key=lambda kv: kv[1].get("ts", 0))[: len(data) - _MAX_ENTRIES]:
+                    data.pop(k, None)
+            tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False)
+            os.replace(tmp, path)  # atomic; tolerates concurrent writers racing
     except Exception:
         return
 
