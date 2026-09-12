@@ -920,6 +920,17 @@ class SessionSchemaMixin:
             )
         except sqlite3.OperationalError as exc:
             logger.debug("idx_messages_platform_msg_id create skipped: %s", exc)
+        # B08/W54-F004: client-side idempotency key for the transcript retry queue. The partial
+        # UNIQUE index makes a retried append after an ambiguously-settled commit (row landed,
+        # IOERR raised) a no-op instead of a duplicate transcript row. NULLs (all rows written
+        # before the stamp existed, and every non-gateway writer) stay exempt.
+        try:
+            cursor.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS messages_client_msg_id "
+                "ON messages(client_msg_id) WHERE client_msg_id IS NOT NULL"
+            )
+        except sqlite3.OperationalError as exc:
+            logger.debug("messages_client_msg_id create skipped: %s", exc)
         self._execute_ddl_skipping_settled_triggers(cursor, DEFERRED_INDEX_SQL)  # same ordering constraint (``active``)
 
         # Heal NULL ``active`` rows on every startup: older reconciler builds added ``active``

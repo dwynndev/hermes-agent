@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import threading
+import uuid
 from agent.turn_context import extract_api_content_sidecar
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -122,10 +123,21 @@ class SessionTranscriptMixin:
             session_id = reroutes[session_id]
         return session_id
 
+    @staticmethod
+    def _stamp_client_msg_id(message: Dict[str, Any]) -> Dict[str, Any]:
+        """Force a client-side idempotency key onto a queued transcript message (B08/W54-F004).
+
+        Stamped at first enqueue so the key rides the dict through the retry queue and the
+        on-disk spool unchanged; ``append_message`` OR-IGNOREs on it, so a retried write after
+        an ambiguously-settled commit can never duplicate the transcript row."""
+        if message.get("client_msg_id") is None:
+            message["client_msg_id"] = f"transcript:{uuid.uuid4()}"
+        return message
+
     def _enqueue_transcript_message(self, session_id: str, message: Dict[str, Any]) -> list:
         """Queue *message* (retry lock held); evicts + spools the oldest past the cap."""
         pending = self._dirty_transcripts.setdefault(session_id, [])
-        pending.append(dict(message))
+        pending.append(self._stamp_client_msg_id(dict(message)))
         # Cap pending messages per session to avoid unbounded memory growth when the DB is persistently
         # broken. Spool the evicted oldest message to the on-disk pending spool (same machinery
         # flush_pending_to_file uses at shutdown) so a runtime cap rotation does not silently discard it
@@ -318,7 +330,9 @@ class SessionTranscriptMixin:
         try:
             from gateway.shutdown_flush import drain_transcript_spool
             _replayed, remaining = drain_transcript_spool(
-                session_id, lambda message: self._append_transcript_message(session_id, message),
+                session_id,
+                lambda message: self._append_transcript_message(
+                    session_id, self._stamp_client_msg_id(message)),
             )
             if not remaining:
                 spooled_sessions.discard(session_id)
@@ -343,6 +357,7 @@ class SessionTranscriptMixin:
             tool_call_id=message.get("tool_call_id"),
             **{k: message.get(k) if is_assistant else None for k in _ASSISTANT_ONLY_KEYS},
             platform_message_id=(message.get("platform_message_id") or message.get("message_id")),
+            client_msg_id=message.get("client_msg_id"),
             observed=bool(message.get("observed")),
             timestamp=message.get("timestamp"),
             # Exact bytes sent to the API (prompt-cache-stable replay); must survive every

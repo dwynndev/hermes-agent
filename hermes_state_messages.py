@@ -20,12 +20,16 @@ from hermes_state_common import (
 logger = logging.getLogger("hermes_state")  # caplog tests pin the origin module's name
 
 # One INSERT shape for every message writer (append, batch, replace, compact, import).
+# ON CONFLICT DO NOTHING (B08/W54-F004): keyed on the messages.client_msg_id UNIQUE partial
+# index, so a retried append after an ambiguously-settled commit cannot duplicate the row.
+# Writers that pass no client_msg_id always insert (NULLs are exempt from the partial index).
 _INSERT_MESSAGE_SQL = """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, _compressed_summary, active, api_content, display_kind,
+                   codex_message_items, platform_message_id, client_msg_id, observed, _compressed_summary, active, api_content, display_kind,
                    display_metadata, display_identity)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(client_msg_id) WHERE client_msg_id IS NOT NULL DO NOTHING"""
 _BUMP_GENERATION_SQL = """
             INSERT INTO conversation_generations (source, session_key, generation)
             VALUES (?, ?, 1)
@@ -259,6 +263,7 @@ class SessionMessagesMixin:
             *(self._reasoning_json_text(_reasoning(k))
               for k in ("reasoning_details", "codex_reasoning_items", "codex_message_items")),
             msg.get("platform_message_id") or msg.get("message_id"),
+            msg.get("client_msg_id"),
             1 if msg.get("observed") else 0, 1 if msg.get("_compressed_summary") else 0, 1,
             _str_or_none(msg.get("api_content")), _str_or_none(msg.get("display_kind")),
             display_metadata, self._display_identity(self._display_dedupe_key(identity_row)))
@@ -284,10 +289,14 @@ class SessionMessagesMixin:
         effect_disposition: Optional[str] = None, _compressed_summary: bool = False, timestamp: Any = None,
         api_content: Optional[str] = None, display_kind: Optional[str] = None,
         display_metadata: Optional[Dict[str, Any]] = None, compression_lock_holder: Optional[str] = None,
+        client_msg_id: Optional[str] = None,
         turn_lease_holder: Optional[str] = None, turn_lease_ttl_seconds: float = 300.0) -> int:
         """Append one message; returns the row id and bumps the session counters. ``platform_message_id``:
         the platform's own id. ``api_content``: byte-fidelity sidecar, the exact string sent to the API when
-        it differed from ``content``, stored as sent except lone surrogates."""
+        it differed from ``content``, stored as sent except lone surrogates. ``client_msg_id``: client-side
+        idempotency key (B08/W54-F004) — the insert ON-CONFLICT-does-nothing on it, so a retry whose
+        prior write already settled (commit raised after landing) returns the existing row without
+        touching the counters."""
         msg = dict(locals())  # every keyword above is a message-dict field of the same name
         # Encode outside the write txn (display metadata first: log-order parity).
         msg["display_metadata"] = self._encode_display_metadata(display_metadata)
@@ -298,9 +307,18 @@ class SessionMessagesMixin:
         def _do(conn):
             self._check_transcript_write_guards(conn, session_id, compression_lock_holder,
                 turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds)
-            msg_id = conn.execute(_INSERT_MESSAGE_SQL, params).lastrowid
-            self._bump_session_counters(conn, session_id, 1, _tool_calls_count(tool_calls), unit=True)
-            return msg_id
+            cur = conn.execute(_INSERT_MESSAGE_SQL, params)
+            if cur.rowcount > 0:
+                self._bump_session_counters(conn, session_id, 1, _tool_calls_count(tool_calls), unit=True)
+                return cur.lastrowid
+            # ON CONFLICT DO NOTHING skipped the insert: this client_msg_id already landed on an
+            # earlier ambiguously-settled write. Return the settled row; counters were bumped then.
+            if client_msg_id is not None:
+                existing = conn.execute(
+                    "SELECT id FROM messages WHERE client_msg_id = ?", (client_msg_id,)).fetchone()
+                if existing is not None:
+                    return existing[0]
+            return cur.lastrowid
         # THE critical write (failure aborts the turn): long patience so a sibling legitimately
         # holding the lock for seconds (VACUUM, checkpoint) can't kill it.
         return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
