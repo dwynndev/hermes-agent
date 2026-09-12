@@ -151,10 +151,12 @@ class _Registry:
 
     lock: threading.RLock = dataclasses.field(default_factory=threading.RLock)
     records: dict[str, _Record] = dataclasses.field(default_factory=dict)
-    correlations: dict[tuple[Optional[str], str], str] = dataclasses.field(default_factory=dict)
+    # Values: _CORRELATION_CLAIM while a launch is building its child, then the subagent_id string.
+    correlations: dict[tuple[Optional[str], str], object] = dataclasses.field(default_factory=dict)
 
 
 _REGISTRY = _Registry()
+_CORRELATION_CLAIM = object()  # reservation value closing the check->claim race for a correlation key
 from tools.daemon_pool import DaemonThreadPoolExecutor as _DaemonExecutor  # daemon: a wedged child never blocks exit
 _EXECUTOR = _DaemonExecutor(max_workers=8, thread_name_prefix="hermes-lifecycle")
 _SECRET = secrets.token_bytes(32)
@@ -255,23 +257,38 @@ class SubagentLifecycleService:
             self._cleanup_locked()
             if request.correlation_id and correlation_key in _REGISTRY.correlations:
                 raise SubagentLifecycleError("Duplicate correlation_id for this parent session.")
+            # Claim the key atomically with the duplicate check so a concurrent
+            # launch with the same correlation_id cannot slip through the child
+            # build below; the placeholder is replaced by the real subagent_id
+            # in the second critical section (W54-F002).
+            if request.correlation_id:
+                _REGISTRY.correlations[correlation_key] = _CORRELATION_CLAIM
         # Lazy: delegate construction stays internal, plugins never import private delegation helpers.
-        from tools.delegate_tool import _build_child_preserving_parent_tools, DEFAULT_MAX_ITERATIONS
-        child = _build_child_preserving_parent_tools(
-            task_index=0, goal=request.goal, context=request.context,
-            toolsets=list(request.allowed_toolsets) if request.allowed_toolsets else None,
-            model=request.model, max_iterations=DEFAULT_MAX_ITERATIONS, task_count=1, parent_agent=parent, role=request.role,
-        )
-        subagent_id = str(getattr(child, "_subagent_id", "") or "")
-        if not subagent_id:
-            raise SubagentLifecycleError("Hermes failed to assign a child identity.")
-        created = time.time()
-        handle = SubagentHandle(
-            PUBLIC_CONTRACT_VERSION, subagent_id, parent_session_id, request.correlation_id, created,
-            getattr(child, "provider", None), getattr(child, "model", None), getattr(child, "_delegate_role", request.role),
-            int(getattr(child, "_delegate_depth", 1) or 1), self._capability(subagent_id, parent_session_id, created),
-        )
-        record = _Record(handle, SubagentState.PENDING, created, agent=child)
+        try:
+            from tools.delegate_tool import _build_child_preserving_parent_tools, DEFAULT_MAX_ITERATIONS
+            child = _build_child_preserving_parent_tools(
+                task_index=0, goal=request.goal, context=request.context,
+                toolsets=list(request.allowed_toolsets) if request.allowed_toolsets else None,
+                model=request.model, max_iterations=DEFAULT_MAX_ITERATIONS, task_count=1, parent_agent=parent, role=request.role,
+            )
+            subagent_id = str(getattr(child, "_subagent_id", "") or "")
+            if not subagent_id:
+                raise SubagentLifecycleError("Hermes failed to assign a child identity.")
+            created = time.time()
+            handle = SubagentHandle(
+                PUBLIC_CONTRACT_VERSION, subagent_id, parent_session_id, request.correlation_id, created,
+                getattr(child, "provider", None), getattr(child, "model", None), getattr(child, "_delegate_role", request.role),
+                int(getattr(child, "_delegate_depth", 1) or 1), self._capability(subagent_id, parent_session_id, created),
+            )
+            record = _Record(handle, SubagentState.PENDING, created, agent=child)
+        except BaseException:
+            # Roll the claim back on any build failure so a failed launch does
+            # not poison the correlation key for a later retry.
+            if request.correlation_id:
+                with _REGISTRY.lock:
+                    if _REGISTRY.correlations.get(correlation_key) is _CORRELATION_CLAIM:
+                        _REGISTRY.correlations.pop(correlation_key, None)
+            raise
         with _REGISTRY.lock:
             _REGISTRY.records[subagent_id] = record
             if request.correlation_id:
