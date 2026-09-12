@@ -259,6 +259,9 @@ def _jobs_lock():
         # stamps from unlocked loads or prior sections can never suppress a needed merge.
         # See #80703.
         _jobs_lock_state.load_stamp = None
+        # Flock contention result for this section: _save_jobs_unlocked refuses stale commits
+        # under a degraded (in-process-only) lock instead of clobbering a sibling's write.
+        _jobs_lock_state.degraded = False
         lock_fd = None
         try:
             try:
@@ -266,6 +269,7 @@ def _jobs_lock():
                 lock_fd = open(_jobs_lock_file(), "a+", encoding="utf-8")
                 lock_fd.seek(0)
                 if _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS) is False:
+                    _jobs_lock_state.degraded = True
                     logger.error(
                         "Timed out after %.0fs waiting for the cron "
                         "jobs lock (%s) — another process is holding "
@@ -287,6 +291,7 @@ def _jobs_lock():
         finally:
             _jobs_lock_state.depth = 0
             _jobs_lock_state.load_stamp = None
+            _jobs_lock_state.degraded = False
 
 
 @contextlib.contextmanager
@@ -1235,6 +1240,41 @@ def _parse_jobs_file(jobs_file: Path) -> Tuple[Any, bool]:
         return json.loads(raw, strict=False), True
 
 
+def _jobs_from_parsed_data(
+    data: Any, strict_retry: bool
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """Canonicalize a parsed jobs.json payload -> ``(jobs, repair_reason)``.
+
+    Accepts the canonical dict, a legacy id-keyed map, or a bare list (auto-repair cases);
+    any other top-level shape is corruption (RuntimeError). ``repair_reason`` is None when
+    the payload needs no repair-save.
+    """
+    repair = "had invalid control characters" if strict_retry else None
+    if isinstance(data, dict):
+        jobs_raw = data.get("jobs", [])
+        if isinstance(jobs_raw, dict):
+            # ID-keyed map from external tools: flatten (inline "id" wins, else the key), skip junk.
+            # _peek_jobs_unlocked deliberately does NOT flatten, so saves never merge against it.
+            skipped = [k for k, v in jobs_raw.items() if not isinstance(v, dict)]
+            if skipped:
+                logger.warning(
+                    "Skipping %d non-dict entr%s in id-keyed jobs map: %s",
+                    len(skipped), "y" if len(skipped) == 1 else "ies",
+                    ", ".join(map(repr, skipped)))
+            jobs = [{**v, "id": v.get("id") or k}
+                    for k, v in jobs_raw.items() if isinstance(v, dict)]
+            repair = "id-keyed jobs map flattened to list"
+        else:
+            jobs = jobs_raw
+    elif isinstance(data, list):
+        jobs = data
+        repair = "bare list wrapped as dict"
+    else:
+        raise RuntimeError(
+            f"Cron database corrupted: expected {{'jobs': [...]}}, got {type(data).__name__}")
+    return jobs, repair
+
+
 def load_jobs() -> List[Dict[str, Any]]:
     """Load all jobs from storage."""
     jobs_file = _current_cron_store().jobs_file
@@ -1257,29 +1297,27 @@ def load_jobs() -> List[Dict[str, Any]]:
 
     # Accept the canonical dict, or a bare list (auto-repair); any other top-level shape is
     # corruption.
-    repair = "had invalid control characters" if _strict_retry else None
-    if isinstance(data, dict):
-        jobs = data.get("jobs", [])
-        if isinstance(jobs, dict):
-            # ID-keyed map from external tools: flatten (inline "id" wins, else the key), skip junk.
-            # _peek_jobs_unlocked deliberately does NOT flatten, so saves never merge against it.
-            skipped = [k for k, v in jobs.items() if not isinstance(v, dict)]
-            if skipped:
-                logger.warning(
-                    "Skipping %d non-dict entr%s in id-keyed jobs map: %s",
-                    len(skipped), "y" if len(skipped) == 1 else "ies",
-                    ", ".join(map(repr, skipped)))
-            jobs = [{**v, "id": v.get("id") or k} for k, v in jobs.items() if isinstance(v, dict)]
-            repair = "id-keyed jobs map flattened to list"
-    elif isinstance(data, list):
-        jobs = data
-        repair = "bare list wrapped as dict"
-    else:
-        raise RuntimeError(
-            f"Cron database corrupted: expected {{'jobs': [...]}}, got {type(data).__name__}")
+    jobs, repair = _jobs_from_parsed_data(data, _strict_retry)
     if jobs and repair:
-        save_jobs(jobs)
-        logger.warning("Auto-repaired jobs.json (%s)", repair)
+        # W54-F008: the parse above was an UNLOCKED read — a concurrent writer can land a new
+        # commit between that read and a repair-save, and the stale snapshot would clobber it.
+        # Re-parse under the exclusive lock and repair-save only a FRESH read that still needs
+        # it; a well-formed replacement (or an unreadable store) leaves the file untouched.
+        with _jobs_lock():
+            try:
+                fresh_data, fresh_strict = _parse_jobs_file(jobs_file)
+            except Exception as e:
+                logger.warning("Skipping jobs.json auto-repair re-parse: %s", e)
+                fresh_data = None
+            if fresh_data is not None:
+                try:
+                    fresh_jobs, fresh_repair = _jobs_from_parsed_data(fresh_data, fresh_strict)
+                except RuntimeError:
+                    # A differently-broken rewrite owns the file now — never repair over it.
+                    fresh_jobs, fresh_repair = [], None
+                if fresh_jobs and fresh_repair:
+                    save_jobs(fresh_jobs)
+                    logger.warning("Auto-repaired jobs.json (%s)", fresh_repair)
     _record_load_stamp(pre_read_stamp)
     return jobs
 
@@ -1400,6 +1438,21 @@ def _save_jobs_unlocked(
     recovery)."""
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
+    # W54-F006: under a degraded (in-process-only) lock a foreign writer can commit between this
+    # section's load_jobs() and its save. Committing a payload built on that stale read loses the
+    # sibling's field updates or resurrects a job it deleted. Fail loudly instead of blind-writing;
+    # a retry in a fresh section re-reads the store. The scheduler's next tick re-derives from
+    # disk, so a raised save self-heals without wedging the ticker.
+    if (
+        not replace
+        and getattr(_jobs_lock_state, "degraded", False)
+        and getattr(_jobs_lock_state, "load_stamp", None) is not None
+        and _jobs_file_stamp(jobs_file) != _jobs_lock_state.load_stamp
+    ):
+        raise RuntimeError(
+            "Refusing to commit cron jobs: jobs.json changed after this section loaded it "
+            "while the cross-process lock was unavailable (degraded mode) — a concurrent "
+            "writer's state would be clobbered. Retry the mutation (#W54-F006).")
     # Owner snapshot BEFORE replace so a root writer can hand the file back to the gateway user.
     _stat_before = None
     for probe in (jobs_file, jobs_file.parent):
@@ -1969,6 +2022,13 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         raise ValueError(f"Cron job field(s) cannot be updated: {', '.join(sorted(bad_fields))}")
 
     def apply(jobs, i, job):
+        # W54-F007: run-now instants (trigger_job) are minted HERE on the merged record under the
+        # lock — never on an unlocked pre-read — and stamped string-exact into both fields so the
+        # manual_run_at == next_run_at convention holds for the record version that is committed.
+        if updates.pop("_manual_run_now", False):
+            manual_run_at = _hermes_now().isoformat()
+            updates["manual_run_at"] = manual_run_at
+            updates["next_run_at"] = manual_run_at
         _rederive_repeat_for_schedule_change(job, updates)
         _normalize_job_updates(job, updates)
         previous_inference_axes = _normalized_inference_axes(job)
@@ -2024,21 +2084,19 @@ def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, A
 
 def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
     """Resume a paused job and compute the next future run from now. Accepts a job ID or name."""
+    # Existence/name check ONLY — no schedule-derived next_run_at on this UNLOCKED read. The
+    # derivation moves into update_job.apply on the merged record so a concurrent schedule edit
+    # can never be stamped over with a value computed from the stale snapshot (#W54-F007).
     job = resolve_job_ref(job_id)
     if not job:
         return None
-    next_run_at = compute_next_run(job["schedule"])
-    if next_run_at is None and job["schedule"].get("kind") == "once":
-        run_at = job["schedule"].get("run_at", "unknown")
-        raise ValueError(
-            f"Cannot resume: one-shot time {run_at} is in the past "
-            f"(grace window: {ONESHOT_GRACE_SECONDS}s) and will never fire.")
     return update_job(job["id"], {
         "enabled": True,
         "state": "scheduled",
         "paused_at": None,
         "paused_reason": None,
-        "next_run_at": next_run_at,
+        # Explicit None: _fill_missing_next_run derives from the MERGED schedule under the lock.
+        "next_run_at": None,
     })
 
 
@@ -2054,15 +2112,15 @@ def trigger_job(job_id: str, extra_prompt: Optional[str] = None) -> Optional[Dic
             f"Cannot run: job '{name}' is {job.get('state')} (terminal). "
             f"Create a new occurrence with 'hermes cron resume {name} "
             "--run-now' or '--at <ISO-8601>'.")
-    manual_run_at = _hermes_now().isoformat()
     return update_job(job["id"], {
         "enabled": True,
         "state": "scheduled",
         "paused_at": None,
         "paused_reason": None,
-        "next_run_at": manual_run_at,
-        # Run-now intent, so cron expression/TZ repair guards don't treat it as stale state.
-        "manual_run_at": manual_run_at,
+        # Run-now instants are stamped INSIDE update_job.apply on the merged record under the
+        # lock (#W54-F007) — keeps the manual_run_at == next_run_at string-exact convention while
+        # binding both to the record version that actually gets committed.
+        "_manual_run_now": True,
         "manual_run_prompt": (extra_prompt or None),
     })
 
