@@ -798,7 +798,14 @@ class SessionSessionsMixin:
     def _set_lineage_column(self, column: str, session_id: str, value: Any) -> bool:
         """Set one ``sessions`` column across a whole compression lineage: Desktop projects roots
         forward to their tip, so updating only the tip would let the root resurrect it on refresh."""
-        return self._write_rowcount(
+        return bool(self._execute_write(
+            lambda conn: self._set_lineage_column_on_conn(conn, column, session_id, value),
+        ) > 0)
+
+    def _set_lineage_column_on_conn(self, conn, column: str, session_id: str, value: Any) -> int:
+        """Same lineage UPDATE as :meth:`_set_lineage_column`, run inside an existing write
+        transaction (no lock/txn of its own — callers gate it on their own CAS)."""
+        rowcount = conn.execute(
             f"""
             WITH RECURSIVE
               ancestors(id) AS (
@@ -829,7 +836,10 @@ class SessionSessionsMixin:
             WHERE id IN (SELECT id FROM lineage)
             """,
             (session_id, session_id, value),
-        ) > 0
+        ).rowcount
+        if rowcount is None or rowcount < 0:
+            rowcount = conn.execute("SELECT changes()").fetchone()[0]
+        return int(rowcount)
 
     def set_session_archived(self, session_id: str, archived: bool) -> bool:
         """Soft-hide (or unhide) a session and its compression lineage; messages are kept."""
@@ -869,14 +879,38 @@ class SessionSessionsMixin:
             pass
         if (tip.get("end_reason") or "") not in self.RECOVERABLE_END_REASONS:
             return False
-        if not self.set_session_archived(session_id, False):
-            return False
-        # Clear the accidental end stamp, or a LATER deliberate archive (which never
-        # writes end_reason) would auto-resurrect on the next lookup.
-        self._write_sql(
-            "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?", (tip["id"],),
-        )
-        return True
+
+        tip_id = tip["id"]
+
+        def _do(conn) -> bool:
+            # Authoritative recheck INSIDE the write txn: the fast-path pre-reads above are
+            # only a hint.  A deliberate archive that landed in the check->write window must
+            # abort this recovery (B09/W54-F005) — otherwise the CAS below is the only gate
+            # and the boundary stamp wins.
+            stamped = conn.execute(
+                "SELECT end_reason FROM sessions WHERE id = ?", (tip_id,),
+            ).fetchone()
+            if stamped is None or (stamped[0] or "") not in self.RECOVERABLE_END_REASONS:
+                return False
+            # Single conditional UPDATE whose rowcount gates the return: the unarchive
+            # and the accidental-stamp clear are one atomic act that matches ONLY rows
+            # whose tip still carries a recoverable stamp (literals interpolated from
+            # _RECOVERABLE_END_REASONS so they cannot drift, same as the existing SQL).
+            updated = conn.execute(
+                "UPDATE sessions SET archived = 0, ended_at = NULL, end_reason = NULL "
+                f"WHERE id = ? AND end_reason IN ({_RECOVERABLE_END_REASONS_SQL})",
+                (tip_id,),
+            ).rowcount
+            if updated is None or updated < 0:
+                updated = conn.execute("SELECT changes()").fetchone()[0]
+            if not updated:
+                return False
+            # Unarchive the rest of the compression lineage in the SAME transaction
+            # (set_session_archived scope), gated by the tip CAS above.
+            self._set_lineage_column_on_conn(conn, "archived", session_id, 0)
+            return True
+
+        return bool(self._execute_write(_do))
 
     def set_session_pinned(self, session_id: str, pinned: bool) -> bool:
         """Pin/unpin a session and its compression lineage (pins are exempt from the auto_archive sweep).
