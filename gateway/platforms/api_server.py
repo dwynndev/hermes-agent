@@ -2754,6 +2754,22 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             logger.warning("Failed to load session history for %s: %s", session_id, exc)
             return []
 
+    async def _conversation_history_watermark(self, session_id: str) -> Optional[int]:
+        """Transcript watermark (MAX active message id) captured BEFORE the paired history read.
+
+        The PRE-admission read->acquire window (W54-F003): capturing the watermark FIRST means the
+        ordering can only over-report staleness (a needless reload after admission), never
+        under-report it. ``None`` on failure — admission then keeps the pre-fix behaviour.
+        """
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return None
+        try:
+            return await asyncio.to_thread(db.get_active_message_watermark, session_id)
+        except Exception as exc:
+            logger.warning("Failed to capture session history watermark for %s: %s", session_id, exc)
+            return None
+
     @_require_auth
     async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
         """GET /api/sessions — list persisted Hermes sessions."""
@@ -3117,8 +3133,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return err
         gateway_session_key = ctx["gateway_session_key"]
         session_id = ctx["session_id"]
+        history_watermark = await self._conversation_history_watermark(session_id)
         history = await self._conversation_history_for_session(session_id)
-        result, usage = await self._run_agent(conversation_history=history, **ctx["run_kwargs"])
+        result, usage = await self._run_agent(
+            conversation_history=history, conversation_watermark=history_watermark, **ctx["run_kwargs"]
+        )
         is_dict = isinstance(result, dict)
         effective_session_id = result.get("session_id") if is_dict else session_id
         final_response = _resolve_media_to_data_urls(
@@ -3171,9 +3190,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     "runtime": runtime_meta}))
                 self._set_run_status(run_id, "running", last_event="run.started")
                 await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
+                history_watermark = await self._conversation_history_watermark(session_id)
                 history = await self._conversation_history_for_session(session_id)
                 result, usage = await self._run_agent(
-                    conversation_history=history, stream_delta_callback=_delta,
+                    conversation_history=history, conversation_watermark=history_watermark,
+                    stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress, active_run_id=run_id, **ctx["run_kwargs"])
                 is_dict = isinstance(result, dict)
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if is_dict else "")
@@ -3668,7 +3689,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None, route_source: str = "global",
         confirmed_runtime_lock: bool = False, bind_declared_conversation: bool = False,
         session_history_delivery: str = "", turn_author: Optional[Dict[str, Any]] = None,
-        relay_metadata: Optional[Dict[str, Any]] = None) -> tuple:
+        relay_metadata: Optional[Dict[str, Any]] = None, conversation_watermark: Optional[int] = None) -> tuple:
         """Create an agent and run one turn in a thread executor -> ``(result, usage)``.
         ``agent_ref[0]`` receives the agent so SSE writers can interrupt it; ``active_run_id``
         registers it in ``_active_run_agents``. Under a confirmed model lock the actual
@@ -3701,6 +3722,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         gateway_session_key=gateway_session_key, requested_model=requested_model,
                         requested_provider=requested_provider, model_options=model_options, route=route,
                         session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock)
+                    # W54-F003: thread the pre-read watermark as an attribute, not a
+                    # run_conversation kwarg (keeps **kwargs fakes in gateway tests intact).
+                    agent._conversation_watermark = conversation_watermark
                     if agent_ref is not None:
                         agent_ref[0] = agent
                     if active_run_id:

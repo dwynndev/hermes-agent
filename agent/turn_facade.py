@@ -77,9 +77,14 @@ class TurnFacadeMixin:
         try:
             # First statement of the try so the finally's note_turn_finished balances every exit.
             _review_queue.note_turn_started()
+            # Threaded by _run_agent as an attribute (W54-F003): keeping it off the
+            # signature avoids the plumbing collision that broke run_conversation(**kwargs)
+            # fakes in unrelated gateway tests.
+            conversation_watermark = getattr(self, "_conversation_watermark", None)
             admission = admit_durable_turn_lease(
                 self, session_id=session_id, relay_turn_id=relay_turn_id, task_context=task_context,
                 conversation_history=conversation_history,
+                conversation_watermark=conversation_watermark,
             )
             if admission.early_result is not None:
                 relay_outcome = (

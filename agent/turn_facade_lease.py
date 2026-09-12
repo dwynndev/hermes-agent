@@ -233,12 +233,19 @@ def _durable_session_exists(db, session_id: str) -> bool:
 def admit_durable_turn_lease(
     agent, *, session_id: str, relay_turn_id: str, task_context: Dict[str, Any],
     conversation_history: Optional[List[Dict[str, Any]]],
+    conversation_watermark: Optional[int] = None,
 ) -> TurnLeaseAdmission:
     """Acquire the session turn lease when the session is durable; build (not start) its threads.
 
     Mutates ``task_context["session_id"]`` and ``agent.session_id`` when the wait forced a resume-id
     reload. Returns an ``early_result`` (interrupted / timed out) instead of a lease when admission
-    fails; the caller returns it verbatim."""
+    fails; the caller returns it verbatim.
+
+    ``conversation_watermark`` is the transcript ``MAX(active message id)`` captured WITH the
+    caller's pre-admission history read (W54-F003): after a successful IMMEDIATE acquire it is
+    re-checked against the live watermark so a turn whose history predates another writer's full
+    turn reloads instead of running stale.
+    """
     db = getattr(agent, "_session_db", None)
     admission = TurnLeaseAdmission(conversation_history=conversation_history)
     if db is None or not session_id:
@@ -282,7 +289,23 @@ def admit_durable_turn_lease(
     agent._active_session_turn_lease_holder = holder
     agent._active_session_turn_lease_ttl_seconds = LEASE_TTL_SECONDS
     try:
-        if waited:
+        # Reload when the acquire waited — OR when another writer's full turn committed between
+        # this request's pre-admission history read and the (immediate) acquire (W54-F003):
+        # `waited` only reflects FAILED first attempts and misses that exact window.
+        reload_needed = waited
+        if not reload_needed and conversation_watermark is not None:
+            try:
+                live_watermark = db.get_active_message_watermark(session_id)
+            except Exception:
+                # A failed probe must not fail the turn: degrade to the exact pre-fix behaviour
+                # (keep the passed history) for this acquisition.
+                logger.debug(
+                    "Could not re-check transcript watermark after immediate lease acquisition "
+                    "for %s; keeping the passed history", session_id, exc_info=True,
+                )
+                live_watermark = conversation_watermark
+            reload_needed = live_watermark > conversation_watermark
+        if reload_needed:
             agent._emit_status("Session is free; loading the latest transcript...")
             # The holder may have compressed/rotated the session while we waited: reload only
             # AFTER admission; an immediate acquisition skips this (needless prompt-cache miss).
