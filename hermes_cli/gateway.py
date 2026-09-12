@@ -507,7 +507,7 @@ def _escalate_wedged_gateway(pid: int, *, term_grace: float = 5.0, kill_wait: fl
     from gateway.status import get_process_start_time
     expected_start_time = get_process_start_time(pid)
     try:
-        terminate_pid(pid, force=False)
+        terminate_pid(pid, force=False, expected_start_time=expected_start_time)
     except (ProcessLookupError, PermissionError, OSError):
         return _wait_for_pid_exit(pid, 1.0)
     if _wait_for_pid_exit(pid, max(float(term_grace), 0.0)):
