@@ -5,6 +5,7 @@ compilation, and fence-aware markdown chunking."""
 import json
 import logging
 import re
+import threading
 import time
 from pathlib import Path
 from gateway.platforms.event import MessageEvent
@@ -20,24 +21,28 @@ class MessageDeduplicator:
         self._seen: dict[str, float] = {}
         self._max_size = max_size
         self._ttl = ttl_seconds
+        # Cross-thread safety: google_chat calls is_duplicate from both the Pub/Sub worker
+        # thread and the HTTP loop thread; the check-and-record must be atomic (W54-F013).
+        self._lock = threading.Lock()
 
     def is_duplicate(self, msg_id: str) -> bool:
         """Return True if *msg_id* was already seen within the TTL window."""
         if not msg_id:
             return False
-        now = time.time()
-        if msg_id in self._seen:
-            if now - self._seen[msg_id] < self._ttl:
-                return True
-            del self._seen[msg_id]  # expired: treat as new
-        self._seen[msg_id] = now
-        if len(self._seen) > self._max_size:
-            cutoff = now - self._ttl
-            self._seen = {k: v for k, v in self._seen.items() if v > cutoff}
+        with self._lock:
+            now = time.time()
+            if msg_id in self._seen:
+                if now - self._seen[msg_id] < self._ttl:
+                    return True
+                del self._seen[msg_id]  # expired: treat as new
+            self._seen[msg_id] = now
             if len(self._seen) > self._max_size:
-                # All entries still fresh: keep the newest so max_size holds under load.
-                self._seen = dict(sorted(self._seen.items(), key=lambda item: item[1])[-self._max_size:])
-        return False
+                cutoff = now - self._ttl
+                self._seen = {k: v for k, v in self._seen.items() if v > cutoff}
+                if len(self._seen) > self._max_size:
+                    # All entries still fresh: keep the newest so max_size holds under load.
+                    self._seen = dict(sorted(self._seen.items(), key=lambda item: item[1])[-self._max_size:])
+            return False
 
     def contains(self, msg_id: str) -> bool:
         """Return whether *msg_id* is live in the cache without inserting it."""
@@ -51,7 +56,8 @@ class MessageDeduplicator:
 
     def discard(self, msg_id: str) -> None:
         """Release a claimed message ID after cancelled/failed handoff."""
-        self._seen.pop(msg_id, None)
+        with self._lock:
+            self._seen.pop(msg_id, None)
 
     def clear(self):
         self._seen.clear()

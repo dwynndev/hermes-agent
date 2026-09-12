@@ -2977,14 +2977,27 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         fork_id = str(body.get("id") or body.get("session_id") or f"api_{int(time.time())}_{uuid.uuid4().hex[:8]}").strip()
         if not fork_id or re.search(r'[\r\n\x00]', fork_id):
             return _error_response("Invalid session ID", 400, code="invalid_session_id")
-        if await asyncio.to_thread(db.get_session, fork_id):
+
+        def _atomic(conn):
+            # One BEGIN IMMEDIATE write: a concurrent same-id fork (client retry / double-click)
+            # blocks and sees the row instead of racing a separate check + upsert (W54-F001).
+            if conn.execute("SELECT id FROM sessions WHERE id = ?", (fork_id,)).fetchone():
+                return "exists"
+            conn.execute(
+                """INSERT INTO sessions (
+                   id, source, model, system_prompt, parent_session_id, started_at
+                ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (fork_id, "api_server", source.get("model"), source.get("system_prompt"), source_id, time.time()))
+            db._inherit_parent_session_metadata(conn, fork_id)
+            return True
+        created = await asyncio.to_thread(db._execute_write, _atomic)
+        if created == "exists":
             return _error_response(f"Session already exists: {fork_id}", 409, code="session_exists")
+        if created is not True:
+            return _error_response("Failed to create forked session", 500, code="session_create_failed")
 
         # CLI /branch semantics: end the original as branched, create a child with the transcript.
         await asyncio.to_thread(db.end_session, source_id, "branched")
-        await asyncio.to_thread(
-            db.create_session, fork_id, "api_server", model=source.get("model"),
-            system_prompt=source.get("system_prompt"), parent_session_id=source_id)
         messages = await asyncio.to_thread(db.get_messages, source_id)
         await asyncio.to_thread(db.replace_messages, fork_id, messages)
         title = body.get("title")

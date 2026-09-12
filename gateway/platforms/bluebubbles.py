@@ -24,7 +24,7 @@ from gateway.platforms.base import (
 )
 from gateway.platforms.event import MessageEvent, MessageType
 from .media_cache import ext_for_mime
-from gateway.platforms.helpers import compile_mention_patterns, strip_markdown
+from gateway.platforms.helpers import MessageDeduplicator, compile_mention_patterns, strip_markdown
 from utils import TRUTHY_STRINGS
 
 # Historical BlueBubbles mime→ext maps, preserved verbatim as overrides for the shared dispatch in
@@ -136,6 +136,8 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         self._private_api_enabled: Optional[bool] = None
         self._helper_connected: bool = False
         self._guid_cache: OrderedDict[str, str] = OrderedDict()
+        # At-least-once webhook delivery: a redelivered guid must not spawn a second run (W54-F014).
+        self._dedup = MessageDeduplicator()
 
     # --- API helpers ---
 
@@ -583,6 +585,10 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         assoc_type = record.get("associatedMessageType")
         if isinstance(assoc_type, int) and assoc_type in _TAPBACK_CODES:  # tapback reactions delivered as messages
             return _ok()
+        guid = self._value(record.get("guid"), record.get("messageGuid"), record.get("id"))
+        if guid and self._dedup.is_duplicate(guid):
+            logger.debug("[bluebubbles] duplicate message guid %s, skipping", guid)
+            return _ok()
         text = self._value(record.get("text"), record.get("message"), record.get("body")) or ""
         media_urls, media_types, msg_type = await self._collect_attachments(record)
         if not text and media_urls:
@@ -602,7 +608,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                                    chat_id_alt=chat_identifier)
         event = MessageEvent(
             text=text, message_type=msg_type, source=source, raw_message=payload,
-            message_id=self._value(record.get("guid"), record.get("messageGuid"), record.get("id")),
+            message_id=guid,
             reply_to_message_id=self._value(record.get("threadOriginatorGuid"), record.get("associatedMessageGuid")),
             media_urls=media_urls, media_types=media_types)
         task = asyncio.create_task(self.handle_message(event))

@@ -107,6 +107,13 @@ def _json_error(message: str, status: int) -> "web.Response":
     return web.json_response({"error": message}, status=status)
 
 
+def _fallback_delivery_id(route_name: str, raw_body: bytes) -> str:
+    """Content-derived idempotency key for senders that carry no delivery-id header: a platform
+    retry is byte-identical (same key → deduped through ``_record_delivery_id``), while two
+    distinct same-instant events hash differently (no false duplicates; W54-F011/F012)."""
+    return hashlib.sha256(route_name.encode("utf-8") + b"\x00" + raw_body).hexdigest()
+
+
 def _peek_session_id(store, session_key: str):
     """Prefer the store's lock-held accessor; the private-path fallback is for older stores / test doubles."""
     if callable(peek := getattr(store, "peek_session_id", None)):
@@ -565,7 +572,7 @@ class WebhookAdapter(BasePlatformAdapter):
             if skills := route_config.get("skills", []):
                 prompt = self._apply_skills(prompt, skills)
         delivery_id = headers.get("X-GitHub-Delivery", headers.get("svix-id", headers.get(
-            "webhook-id", headers.get("X-Request-ID", str(int(time.time() * 1000))))))
+            "webhook-id", headers.get("X-Request-ID", _fallback_delivery_id(route_name, raw_body)))))
         now = time.time()  # idempotency: skip duplicate deliveries (webhook retries)
         if not self._record_delivery_id(delivery_id, now):
             logger.info("[webhook] Skipping duplicate delivery %s", delivery_id)
