@@ -8,6 +8,13 @@ failed approvals, chmod 0600 data files, codes never logged. Storage: ~/.hermes/
 """
 
 import contextlib
+# Cross-process advisory locking for the pairing store files (fcntl on Unix).
+# Unlike cron/jobs.py we never degrade to in-process-only on failure: pairing
+# state is security state, so a wedged sibling must block, not clobber.
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX (Windows)
+    fcntl = None
 import hashlib
 import json
 import logging
@@ -333,6 +340,38 @@ def _entry_created_at(info):
     return created_at if isinstance(created_at, (int, float)) else None
 
 
+@contextlib.contextmanager
+def _pairing_dir_lock(pairing_dir: Path):
+    """Cross-process exclusive lock held across load->modify->save on the store files.
+
+    The gateway and the ``hermes pairing`` CLI are separate processes sharing the
+    same JSON files; the per-store ``threading.RLock`` cannot serialize them, so a
+    concurrent approve can load a stale copy and clobber the other writer's grant.
+    An advisory ``flock`` on the ``.pairing.lock`` sidecar serializes the whole
+    read-modify-write between processes. Acquisition is BLOCKING (no LOCK_NB
+    timeout like cron/jobs.py): pairing state is security state, so fail-open
+    degradation is not acceptable -- a wedged sibling must block rather than race.
+    On platforms without ``fcntl`` (Windows) this is a no-op and the RLock remains
+    the serialization boundary, matching control_socket's POSIX-only scoping.
+
+    Nested callers must NOT acquire this lock (helpers like ``_finish_approval`` run
+    under their public callers' lock): flock treats separate fds for one file as
+    distinct locks, so re-entering through a second fd would self-deadlock.
+    """
+    if fcntl is None:
+        yield
+        return
+    pairing_dir.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(pairing_dir / ".pairing.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
 class PairingStore:
     """Pairing codes and approved user lists.
 
@@ -415,16 +454,17 @@ class PairingStore:
         """Remove a user from the approved list. Returns True if found."""
         path = self._approved_path(platform)
         with self._lock:
-            approved = self._load_json(path)
-            matching_ids = _matching_ids(platform, approved, user_id)
-            if not matching_ids:
-                return False
-            for approved_user_id in matching_ids:
-                del approved[approved_user_id]
-            self._save_json(path, approved)
-            # Keep the allowlist mirror in sync (no-op if added by other means).
-            _sync_allowlist_remove(platform, user_id)
-            return True
+            with _pairing_dir_lock(self._dir):
+                approved = self._load_json(path)
+                matching_ids = _matching_ids(platform, approved, user_id)
+                if not matching_ids:
+                    return False
+                for approved_user_id in matching_ids:
+                    del approved[approved_user_id]
+                self._save_json(path, approved)
+                # Keep the allowlist mirror in sync (no-op if added by other means).
+                _sync_allowlist_remove(platform, user_id)
+                return True
 
     # ----- Pending codes -----
 
@@ -450,23 +490,24 @@ class PairingStore:
         or the platform is locked out. Only a salted SHA-256 hash of the code is persisted.
         """
         with self._lock:
-            self._cleanup_expired(platform)
-            normalized_user_id = _normalize_user_id(platform, user_id)
-            if self._is_locked_out(platform) or self._is_rate_limited(platform, user_id):
-                return None
-            pending = self._load_json(self._pending_path(platform))
-            if len(pending) >= MAX_PENDING_PER_PLATFORM:
-                return None
-            code = "".join(secrets.choice(ALPHABET) for _ in range(CODE_LENGTH))
-            salt = os.urandom(16)
-            # Keyed by a random entry id, not the code itself.
-            pending[secrets.token_hex(8)] = {
-                "hash": self._hash_code(code, salt), "salt": salt.hex(),
-                "user_id": normalized_user_id, "user_name": user_name, "created_at": time.time(),
-            }
-            self._save_json(self._pending_path(platform), pending)
-            self._record_rate_limit(platform, user_id)
-            return code
+            with _pairing_dir_lock(self._dir):
+                self._cleanup_expired(platform)
+                normalized_user_id = _normalize_user_id(platform, user_id)
+                if self._is_locked_out(platform) or self._is_rate_limited(platform, user_id):
+                    return None
+                pending = self._load_json(self._pending_path(platform))
+                if len(pending) >= MAX_PENDING_PER_PLATFORM:
+                    return None
+                code = "".join(secrets.choice(ALPHABET) for _ in range(CODE_LENGTH))
+                salt = os.urandom(16)
+                # Keyed by a random entry id, not the code itself.
+                pending[secrets.token_hex(8)] = {
+                    "hash": self._hash_code(code, salt), "salt": salt.hex(),
+                    "user_id": normalized_user_id, "user_name": user_name, "created_at": time.time(),
+                }
+                self._save_json(self._pending_path(platform), pending)
+                self._record_rate_limit(platform, user_id)
+                return code
 
     def approve_code(self, platform: str, code: str) -> Optional[dict]:
         """Approve a pairing code and add its user to the approved list.
@@ -478,24 +519,25 @@ class PairingStore:
         See #10195.
         """
         with self._lock:
-            self._cleanup_expired(platform)
-            code = code.upper().strip()
-            # Before the lookup, or an already-issued valid code would bypass lockout.
-            if self._is_locked_out(platform):
+            with _pairing_dir_lock(self._dir):
+                self._cleanup_expired(platform)
+                code = code.upper().strip()
+                # Before the lookup, or an already-issued valid code would bypass lockout.
+                if self._is_locked_out(platform):
+                    return None
+                pending = self._load_json(self._pending_path(platform))
+                # Skip legacy/malformed entries so an in-place upgrade doesn't crash.
+                for entry_id, entry in pending.items():
+                    if not _is_hashed_entry(entry):
+                        continue
+                    try:
+                        salt = bytes.fromhex(entry["salt"])
+                    except ValueError:
+                        continue
+                    if secrets.compare_digest(self._hash_code(code, salt), entry["hash"]):
+                        return self._finish_approval(platform, pending, entry_id, entry)
+                self._record_failed_attempt(platform)
                 return None
-            pending = self._load_json(self._pending_path(platform))
-            # Skip legacy/malformed entries so an in-place upgrade doesn't crash.
-            for entry_id, entry in pending.items():
-                if not _is_hashed_entry(entry):
-                    continue
-                try:
-                    salt = bytes.fromhex(entry["salt"])
-                except ValueError:
-                    continue
-                if secrets.compare_digest(self._hash_code(code, salt), entry["hash"]):
-                    return self._finish_approval(platform, pending, entry_id, entry)
-            self._record_failed_attempt(platform)
-            return None
 
     @staticmethod
     def looks_like_request_id(value: str) -> bool:
@@ -513,43 +555,46 @@ class PairingStore:
         attack -- counting it would let a few GUI clicks lock the operator out.
         """
         with self._lock:
-            self._cleanup_expired(platform)
-            request_id = str(request_id or "").strip().lower()
-            if not request_id:
+            with _pairing_dir_lock(self._dir):
+                self._cleanup_expired(platform)
+                request_id = str(request_id or "").strip().lower()
+                if not request_id:
+                    return None
+                pending = self._load_json(self._pending_path(platform))
+                for entry_id, entry in pending.items():
+                    if _is_hashed_entry(entry) and secrets.compare_digest(str(entry_id).lower(), request_id):
+                        return self._finish_approval(platform, pending, entry_id, entry)
                 return None
-            pending = self._load_json(self._pending_path(platform))
-            for entry_id, entry in pending.items():
-                if _is_hashed_entry(entry) and secrets.compare_digest(str(entry_id).lower(), request_id):
-                    return self._finish_approval(platform, pending, entry_id, entry)
-            return None
 
     def list_pending(self, platform: str = None) -> list:
         """List pending requests (codes are never returned; each exposes a ``request_id``
         for :meth:`approve_request`; legacy pre-hash entries report an empty id)."""
         results = []
         with self._lock:
-            for p in self._platforms(platform, "pending"):
-                self._cleanup_expired(p)
-                for entry_id, info in self._load_json(self._pending_path(p)).items():
-                    created_at = _entry_created_at(info)
-                    if created_at is None:
-                        continue
-                    is_modern = isinstance(info.get("hash"), str) and isinstance(info.get("salt"), str)
-                    results.append({
-                        "platform": p,
-                        "request_id": str(entry_id) if is_modern else "",
-                        "user_id": info.get("user_id", ""), "user_name": info.get("user_name", ""),
-                        "age_minutes": int((time.time() - created_at) / 60),
-                    })
+            with _pairing_dir_lock(self._dir):
+                for p in self._platforms(platform, "pending"):
+                    self._cleanup_expired(p)
+                    for entry_id, info in self._load_json(self._pending_path(p)).items():
+                        created_at = _entry_created_at(info)
+                        if created_at is None:
+                            continue
+                        is_modern = isinstance(info.get("hash"), str) and isinstance(info.get("salt"), str)
+                        results.append({
+                            "platform": p,
+                            "request_id": str(entry_id) if is_modern else "",
+                            "user_id": info.get("user_id", ""), "user_name": info.get("user_name", ""),
+                            "age_minutes": int((time.time() - created_at) / 60),
+                        })
         return results
 
     def clear_pending(self, platform: str = None) -> int:
         """Clear all pending requests. Returns count removed."""
         with self._lock:
-            count = 0
-            for p in self._platforms(platform, "pending"):
-                count += len(self._load_json(self._pending_path(p)))
-                self._save_json(self._pending_path(p), {})
+            with _pairing_dir_lock(self._dir):
+                count = 0
+                for p in self._platforms(platform, "pending"):
+                    count += len(self._load_json(self._pending_path(p)))
+                    self._save_json(self._pending_path(p), {})
         return count
 
     # ----- Rate limiting and lockout -----
